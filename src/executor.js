@@ -28,10 +28,8 @@ const discord  = require('./discord');
 // -------------------------------------------------------
 //  CONSTANTS
 // -------------------------------------------------------
-const JUPITER_SWAP_API  = process.env.JUPITER_API_KEY
-    ? 'https://api.jup.ag/swap/v1'
-    : 'https://lite-api.jup.ag/swap/v1';
-const JUPITER_LITE_API  = 'https://lite-api.jup.ag/swap/v1';
+// swap-instructions endpoint rejects API key with 401 — use lite-api directly
+const JUPITER_SWAP_API  = 'https://lite-api.jup.ag/swap/v1';
 const JITO_BUNDLE_URL   = `${process.env.JITO_BLOCK_ENGINE_URL || 'https://mainnet.block-engine.jito.labs.io'}/api/v1/bundles`;
 
 // MarginFi production SOL bank
@@ -157,17 +155,8 @@ class Executor {
             dynamicComputeUnitLimit:   true,
             prioritizationFeeLamports: parseInt(process.env.JITO_TIP_LAMPORTS || '150000'),
         };
-        try {
-            const res = await axios.post(`${JUPITER_SWAP_API}/swap-instructions`, params, { timeout: 6000 });
-            return res.data;
-        } catch (e) {
-            if (e.response?.status === 401 && JUPITER_SWAP_API !== JUPITER_LITE_API) {
-                logger.warn('[Executor] Jupiter API key rejected (401) — falling back to lite-api');
-                const res = await axios.post(`${JUPITER_LITE_API}/swap-instructions`, params, { timeout: 6000 });
-                return res.data;
-            }
-            throw e;
-        }
+        const res = await axios.post(`${JUPITER_SWAP_API}/swap-instructions`, params, { timeout: 6000 });
+        return res.data;
     }
 
     // -------------------------------------------------------

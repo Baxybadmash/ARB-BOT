@@ -86,6 +86,7 @@ async function _jupiterQuote(inputMint, outputMint, amount, extraParams = {}) {
                     amount,
                     slippageBps:         parseInt(process.env.SLIPPAGE_BPS || '50'),
                     asLegacyTransaction: false,
+                    maxAccounts:         parseInt(process.env.JUPITER_MAX_ACCOUNTS || '20'),
                     ...extraParams
                 },
                 timeout: 4000,

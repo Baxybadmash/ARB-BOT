@@ -9,7 +9,7 @@
 //    [setup ixs from Jupiter buy]
 //    swapInstruction (buy tokenB cheap on DEX A)
 //    swapInstruction (sell tokenB dear on DEX B)
-//    lendingAccountRepay   ← repays X SOL + 0.09% fee
+//    lendingAccountRepay   ← repays X SOL (0% fee — confirmed: docs.marginfi.com/faqs)
 //    endFlashLoan (MarginFi)
 //
 //  No wallet capital required — the borrow funds the swap.

@@ -6,8 +6,7 @@
   "scripts": {
     "start": "node src/bot.js",
     "test": "node src/simulate.js",
-    "build": "anchor build",
-    "update-pairs": "node -e \"require('dotenv').config(); const {updatePairs}=require('./src/pairUpdater'); updatePairs(100*1e9).then(p=>{ console.log('Done. Pairs:', p.map(x=>x.name).join(', ')); process.exit(0); })\""
+"update-pairs": "node -e \"require('dotenv').config(); const {updatePairs}=require('./src/pairUpdater'); updatePairs(100*1e9).then(p=>{ console.log('Done. Pairs:', p.map(x=>x.name).join(', ')); process.exit(0); })\""
   },
   "dependencies": {
     "@coral-xyz/anchor": "^0.30.1",

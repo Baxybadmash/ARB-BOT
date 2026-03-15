@@ -127,7 +127,6 @@ async function startBot() {
     const connection = await createConnection();
     const wallet     = loadWallet();
     const config     = {
-        PROGRAM_ID:           process.env.PROGRAM_ID,
         MARGINFI_GROUP:       process.env.MARGINFI_GROUP,
         MIN_PROFIT_USD:       parseFloat(process.env.MIN_PROFIT_USD || '5'),
         FLASHLOAN_AMOUNT_SOL: parseFloat(process.env.FLASHLOAN_AMOUNT_SOL || '100'),

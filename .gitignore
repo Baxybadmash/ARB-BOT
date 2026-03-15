@@ -1,0 +1,7 @@
+.env
+data/marginfi_account.json
+data/pairs.json
+logs/
+target/
+node_modules/
+.claude

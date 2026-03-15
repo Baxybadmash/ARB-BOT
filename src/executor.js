@@ -146,17 +146,49 @@ class Executor {
     // -------------------------------------------------------
     //  GET JUPITER SWAP INSTRUCTIONS  (not full tx)
     //  wrapAndUnwrapSol: false because wSOL comes from MarginFi borrow
+    //  prioritizationFeeLamports omitted — Jito tip handles ordering,
+    //  and including it adds a SetComputeUnitPrice ix that wastes tx bytes.
     // -------------------------------------------------------
     async _getSwapInstructions(quoteResponse) {
         const params = {
             quoteResponse,
-            userPublicKey:             this.wallet.publicKey.toString(),
-            wrapAndUnwrapSol:          false,   // wSOL is managed by MarginFi borrow/repay
-            dynamicComputeUnitLimit:   true,
-            prioritizationFeeLamports: parseInt(process.env.JITO_TIP_LAMPORTS || '150000'),
+            userPublicKey:           this.wallet.publicKey.toString(),
+            wrapAndUnwrapSol:        false,   // wSOL is managed by MarginFi borrow/repay
+            dynamicComputeUnitLimit: true,
         };
         const res = await axios.post(`${JUPITER_SWAP_API}/swap-instructions`, params, { timeout: 6000 });
         return res.data;
+    }
+
+    // -------------------------------------------------------
+    //  MERGE COMPUTE BUDGET INSTRUCTIONS FROM BOTH SWAP LEGS
+    //  Jupiter simulates each leg independently. We combine them
+    //  into one SetComputeUnitLimit that covers the full tx.
+    // -------------------------------------------------------
+    _mergeComputeBudgetIxs(buyBudgetIxs, sellBudgetIxs) {
+        const COMPUTE_BUDGET_PROGRAM = 'ComputeBudget111111111111111111111111111111';
+        const SET_CU_LIMIT_VARIANT   = 2; // instruction discriminator
+        let maxCuLimit = 200_000; // safe default
+
+        for (const ix of [...buyBudgetIxs, ...sellBudgetIxs]) {
+            if (ix.programId.toString() !== COMPUTE_BUDGET_PROGRAM) continue;
+            if (ix.data[0] !== SET_CU_LIMIT_VARIANT) continue;
+            const limit = ix.data.readUInt32LE(1);
+            maxCuLimit  = Math.max(maxCuLimit, limit);
+        }
+
+        // Double the higher of the two leg limits to cover both swaps in one tx,
+        // capped at Solana's per-tx maximum (1.4M CUs).
+        const combinedLimit = Math.min(maxCuLimit * 2, 1_400_000);
+        const limitData     = Buffer.alloc(5);
+        limitData.writeUInt8(SET_CU_LIMIT_VARIANT, 0);
+        limitData.writeUInt32LE(combinedLimit, 1);
+
+        return [new TransactionInstruction({
+            programId: new PublicKey(COMPUTE_BUDGET_PROGRAM),
+            keys:      [],
+            data:      limitData,
+        })];
     }
 
     // -------------------------------------------------------
@@ -248,7 +280,7 @@ class Executor {
             const borrowAmountSol = Number(amountIn) / 1e9;
             const [borrowWrapper, repayWrapper] = await Promise.all([
                 this.mfiAccount.makeBorrowIx(borrowAmountSol, SOL_BANK_PK),
-                this.mfiAccount.makeRepayIx(borrowAmountSol, SOL_BANK_PK, true), // repayAll=true repays principal + 0.09% fee in one step; safe because this is a dedicated flashloan-only account
+                this.mfiAccount.makeRepayIx(borrowAmountSol, SOL_BANK_PK, true), // repayAll=true repays whatever is owed (safe on a flashloan-only account)
             ]);
 
             // ── Step 2: Jupiter swap instructions ─────────────────────
@@ -267,20 +299,44 @@ class Executor {
             // ── Step 4: Build ordered instruction list ─────────────────
             //  Layout inside flashloan wrapper:
             //    borrow → [compute budget] → [setup] → buy swap → sell swap → repay
-            const computeBudgetIxs = (buyIxData.computeBudgetInstructions || []).map(ix => this._deserializeIx(ix));
+            //
+            //  Compute budget: merge both legs to use the higher CU limit × 2.
+            //  This prevents ComputationalBudgetExceeded when the sell leg needs
+            //  more CUs than the buy leg's standalone simulation returned.
+            const buyCbRaw  = (buyIxData.computeBudgetInstructions  || []).map(ix => this._deserializeIx(ix));
+            const sellCbRaw = (sellIxData.computeBudgetInstructions || []).map(ix => this._deserializeIx(ix));
+            const computeBudgetIxs = this._mergeComputeBudgetIxs(buyCbRaw, sellCbRaw);
+
+            // Deduplicate setup instructions across buy + sell:
+            // Jupiter often emits createAssociatedTokenAccountIdempotent for the same
+            // accounts in both swap responses. Keeping both makes the tx exceed 1232 bytes.
+            // We key each instruction by programId + first-writable-account to detect dupes.
+            const buySetupIxs  = (buyIxData.setupInstructions  || []).map(ix => this._deserializeIx(ix));
+            const sellSetupRaw = (sellIxData.setupInstructions || []).map(ix => this._deserializeIx(ix));
+            const seenSetup    = new Set(
+                buySetupIxs.map(ix => {
+                    const firstWritable = ix.keys.find(k => k.isWritable);
+                    return `${ix.programId.toString()}:${firstWritable?.pubkey.toString() ?? ''}`;
+                })
+            );
+            const sellSetupIxs = sellSetupRaw.filter(ix => {
+                const firstWritable = ix.keys.find(k => k.isWritable);
+                const key = `${ix.programId.toString()}:${firstWritable?.pubkey.toString() ?? ''}`;
+                return !seenSetup.has(key);
+            });
 
             const innerIxs = [
-                ...borrowWrapper.instructions,
+                ...(borrowWrapper.instructions || []),
                 ...computeBudgetIxs,
-                ...(buyIxData.setupInstructions   || []).map(ix => this._deserializeIx(ix)),
+                ...buySetupIxs,
                 ...(buyIxData.tokenLedgerInstruction ? [this._deserializeIx(buyIxData.tokenLedgerInstruction)] : []),
                 this._deserializeIx(buyIxData.swapInstruction),
                 ...(buyIxData.cleanupInstruction  ? [this._deserializeIx(buyIxData.cleanupInstruction)] : []),
-                ...(sellIxData.setupInstructions  || []).map(ix => this._deserializeIx(ix)),
+                ...sellSetupIxs,
                 ...(sellIxData.tokenLedgerInstruction ? [this._deserializeIx(sellIxData.tokenLedgerInstruction)] : []),
                 this._deserializeIx(sellIxData.swapInstruction),
                 ...(sellIxData.cleanupInstruction ? [this._deserializeIx(sellIxData.cleanupInstruction)] : []),
-                ...repayWrapper.instructions,
+                ...(repayWrapper.instructions || []),
             ];
 
             // ── Step 5: Build flashloan tx (MarginFi adds begin/end) ──
@@ -291,6 +347,21 @@ class Executor {
                 addressLookupTableAccounts: lookupTables,
                 blockhash,
             });
+
+            // Guard: Solana versioned transactions are capped at 1232 bytes.
+            // Serialise before signing to check size; throw a clear error if oversized.
+            // Note: serialize() itself throws "encoding overruns Uint8Array" when the tx
+            // is so large the buffer can't be allocated — catch that too.
+            let sizeCheck;
+            try {
+                sizeCheck = flashTx.serialize().length;
+            } catch (e) {
+                throw new Error(`Transaction too large to serialize (reduce JUPITER_MAX_ACCOUNTS). ${e.message}`);
+            }
+            if (sizeCheck > 1232) {
+                throw new Error(`Transaction too large: ${sizeCheck} bytes (limit 1232). Reduce JUPITER_MAX_ACCOUNTS.`);
+            }
+            logger.debug(`[Executor] Tx size: ${sizeCheck} bytes`);
 
             // ── Step 6: Sign ──────────────────────────────────────────
             flashTx.sign([this.wallet]);

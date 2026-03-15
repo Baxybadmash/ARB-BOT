@@ -32,7 +32,7 @@ const RATE_LIMIT_PAUSE_MS = 60 * 1000;
 
 // Serial API queue — all Jupiter calls go through here, spaced 150ms apart.
 // This guarantees ≤6.7 calls/sec regardless of how many concurrent scans fire.
-const CALL_INTERVAL_MS = 50; // api.jup.ag with key supports higher throughput
+const CALL_INTERVAL_MS = parseInt(process.env.JUPITER_CALL_INTERVAL_MS || '50');
 let _apiQueue = Promise.resolve();
 
 function _enqueue(fn) {
@@ -86,7 +86,7 @@ async function _jupiterQuote(inputMint, outputMint, amount, extraParams = {}) {
                     amount,
                     slippageBps:         parseInt(process.env.SLIPPAGE_BPS || '50'),
                     asLegacyTransaction: false,
-                    maxAccounts:         parseInt(process.env.JUPITER_MAX_ACCOUNTS || '20'),
+                    maxAccounts:         parseInt(process.env.JUPITER_MAX_ACCOUNTS || '14'),
                     ...extraParams
                 },
                 timeout: 4000,

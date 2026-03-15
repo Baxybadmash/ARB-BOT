@@ -42,7 +42,6 @@ const ANCHOR_PAIRS = [
 const BLACKLIST = new Set([
     USDC_MINT,
     USDT_MINT,
-    'Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB', // USDT
     '9n4nbM75f5Ui33ZbPYXn59EwSgE8CGsHtAeTH5YFeJ9E', // BTC (Sollet, illiquid)
     '2FPyTwcZLUgFDPWPFtinzdBuBGGsWWGkhMSzVnkYEBRq', // ETH (Sollet, illiquid)
     'SRMuApVNdxXokk5GT7XD5cUUgXMBCoAz2LHeuAoKWRt',  // SRM (deprecated)
@@ -169,6 +168,27 @@ async function getMispricingScore(tokenMint, quoteMint, amount) {
     }
 }
 
+// Jupiter strict token list — cached for the duration of a monthly update run
+// (avoids fetching the same multi-MB list once per candidate token)
+let _jupiterTokenCache     = null;
+let _jupiterTokenCacheTime = 0;
+const JUPITER_TOKEN_CACHE_TTL_MS = 15 * 60 * 1000; // 15 min
+
+async function _getJupiterTokens() {
+    if (_jupiterTokenCache && Date.now() - _jupiterTokenCacheTime < JUPITER_TOKEN_CACHE_TTL_MS) {
+        return _jupiterTokenCache;
+    }
+    try {
+        const res = await axios.get('https://token.jup.ag/strict', { timeout: 10000 });
+        _jupiterTokenCache     = res.data || [];
+        _jupiterTokenCacheTime = Date.now();
+        logger.debug(`[PairUpdater] Jupiter strict list cached: ${_jupiterTokenCache.length} tokens`);
+    } catch {
+        _jupiterTokenCache = _jupiterTokenCache || [];
+    }
+    return _jupiterTokenCache;
+}
+
 // -------------------------------------------------------
 //  SCORE A TOKEN FOR ARB POTENTIAL
 //  Returns a score 0-100 (higher = better for arb)
@@ -206,13 +226,9 @@ async function scoreToken(token, flashloanLamports) {
     const testAmount = Math.floor(flashloanLamports / 100);
     score.mispricingScore = await getMispricingScore(token.address, null, testAmount);
 
-    // DEX count score from Jupiter token info
+    // DEX count score from Jupiter token info (uses shared cache — one fetch per update run)
     try {
-        const tokenInfo = await axios.get(
-            `https://token.jup.ag/strict`,
-            { timeout: 3000 }
-        );
-        const allTokens = tokenInfo.data || [];
+        const allTokens = await _getJupiterTokens();
         const found     = allTokens.find(t => t.address === token.address);
         if (found) {
             // More tags/extensions = more DEX listings = better
@@ -241,7 +257,7 @@ function buildPair(token) {
     return {
         name:      `SOL/${token.symbol}`,
         tokenA:    WSOL_MINT,
-        tokenB:    token.address,
+        tokenB:    token.mint || token.address, // scoreToken() stores address as .mint; raw Birdeye tokens use .address
         decimalsA: 9,
         decimalsB: token.decimals || 6,
         isAnchor:  false,
@@ -282,8 +298,8 @@ async function updatePairs(flashloanLamports, telegramAlert = null, discordAlert
         return loadPairs();
     }
 
-    // Filter out blacklisted and anchor tokens
-    const anchorMints = new Set(ANCHOR_PAIRS.map(p => p.tokenA));
+    // Filter out blacklisted tokens and any token already covered by an anchor pair
+    const anchorMints = new Set(ANCHOR_PAIRS.flatMap(p => [p.tokenA, p.tokenB]));
     const candidates  = topTokens.filter(t =>
         t.address &&
         t.symbol &&

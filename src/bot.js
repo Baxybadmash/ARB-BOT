@@ -286,7 +286,7 @@ async function startBot() {
         const solPrice  = getSolPrice();
         const profitUsd = (Number(executor.stats.totalProfit) / 1e9 * solPrice).toFixed(2);
         await discord.send(
-            `📊 **Hourly Stats**\n` +
+            `📊 **Stats (30-min)**\n` +
             `Slots: ${executor.stats.slotsScanned} | Detected: ${executor.stats.oppsDetected} | Attempted: ${executor.stats.oppsAttempted}\n` +
             `Sent: ${executor.stats.txSent} | Success: ${executor.stats.txSuccess} | Profit: ~$${profitUsd}`
         ).catch(() => {});
@@ -299,7 +299,9 @@ async function startBot() {
         logger.info(`\n${signal} received — shutting down...`);
         executor.printStats().catch(() => {});
         poolWatcher.unsubscribeAll();
-        connection.removeSlotChangeListener(subscriptionId);
+        if (subscriptionId !== null) {
+            try { connection.removeSlotChangeListener(subscriptionId); } catch (_) {}
+        }
         await telegram.alertOffline();
         await discord.alertOffline();
         process.exit(0);

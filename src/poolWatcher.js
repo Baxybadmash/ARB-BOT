@@ -194,11 +194,10 @@ class PoolWatcher {
         if (now - last < DEBOUNCE_MS) return; // deduplicate within same slot
         this._debounce[pool.pair.name] = now;
         logger.debug(`[PoolWatcher] ${pool.dex} pool changed → scanning ${pool.pair.name}`);
-        try {
-            callback(pool.pair);
-        } catch (e) {
+        // callback is async — wrap in Promise to catch both sync throws and async rejections
+        Promise.resolve().then(() => callback(pool.pair)).catch(e => {
             logger.error(`[PoolWatcher] Callback error [${pool.pair.name}]: ${e.message}`);
-        }
+        });
     }
 
     // Refresh subscriptions when pair list changes (monthly update)

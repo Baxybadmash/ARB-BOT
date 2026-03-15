@@ -55,7 +55,12 @@ function findOrcaPool(pools, pair) {
 // -------------------------------------------------------
 function calcAmmOptimal(reserveIn, reserveOut) {
     if (!reserveIn || !reserveOut || reserveIn <= 0 || reserveOut <= 0) return null;
-    const optimal = Math.sqrt(reserveIn * reserveOut) - reserveIn;
+    // Scale to SOL units before multiplying to avoid IEEE 754 overflow.
+    // Direct lamport product (e.g. 1M SOL pool: 1e15 * 1e15 = 1e30) exceeds
+    // Number.MAX_SAFE_INTEGER and collapses to Infinity, making sqrt useless.
+    const rIn  = reserveIn  / 1e9;
+    const rOut = reserveOut / 1e9;
+    const optimal = (Math.sqrt(rIn * rOut) - rIn) * 1e9;
     return optimal > 0 ? Math.floor(optimal) : null;
 }
 

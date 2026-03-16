@@ -170,7 +170,7 @@ class PoolWatcher {
                 const pubkey = new PublicKey(pool.address);
                 const subId  = this.connection.onAccountChange(
                     pubkey,
-                    () => this._handleChange(pool, callback),
+                    (accountInfo) => this._handleChange(pool, callback, accountInfo),
                     'confirmed'
                 );
                 this.subscriptions.push({ subId, ...pool });
@@ -188,14 +188,14 @@ class PoolWatcher {
         logger.info(`[PoolWatcher] ✅ ${this.subscriptions.length} subscriptions — ${summary}`);
     }
 
-    _handleChange(pool, callback) {
+    _handleChange(pool, callback, accountInfo) {
         const now  = Date.now();
         const last = this._debounce[pool.pair.name] || 0;
         if (now - last < DEBOUNCE_MS) return; // deduplicate within same slot
         this._debounce[pool.pair.name] = now;
         logger.debug(`[PoolWatcher] ${pool.dex} pool changed → scanning ${pool.pair.name}`);
-        // callback is async — wrap in Promise to catch both sync throws and async rejections
-        Promise.resolve().then(() => callback(pool.pair)).catch(e => {
+        // Pass accountInfo through for future local pool math pre-filtering
+        Promise.resolve().then(() => callback(pool.pair, accountInfo, pool.dex)).catch(e => {
             logger.error(`[PoolWatcher] Callback error [${pool.pair.name}]: ${e.message}`);
         });
     }

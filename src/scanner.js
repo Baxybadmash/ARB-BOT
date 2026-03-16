@@ -131,6 +131,10 @@ class PriceScanner {
         this.activePairs = this._loadActivePairs();
         this.slotCounter = 0;
         this.SCAN_EVERY_N_SLOTS = parseInt(process.env.SCAN_EVERY_N_SLOTS || '3');
+        // Cache last scan result per pair — used as pre-filter to skip Jupiter calls
+        // when a recent scan already confirmed no opportunity.
+        // { pairName → { result: ScanResult|null, timestamp: ms } }
+        this._scanCache = new Map();
     }
 
     _loadActivePairs() {
@@ -170,7 +174,7 @@ class PriceScanner {
     //  Phase 2: sell at optimal size      (1 call)
     //  Total: 2 API calls per pair
     // -------------------------------------------------------
-    async scanPair(pair, minAmountIn, maxAmountIn, quoteFn = _jupiterQuote) {
+    async scanPair(pair, minAmountIn, maxAmountIn, quoteFn = _jupiterQuote, skipReQuote = false) {
         // Phase 1 — buy probe to check liquidity and spread direction
         const buyProbe = await quoteFn(pair.tokenA, pair.tokenB, minAmountIn);
         if (!buyProbe || !buyProbe.outAmount) return null;
@@ -213,8 +217,9 @@ class PriceScanner {
         let grossProfit   = probeProfit;
         let amountIn      = BigInt(minAmountIn);
 
-        // Re-quote at optimal size only if meaningfully larger than probe
-        if (optimalAmount_ > minAmountIn * 1.5) {
+        // Re-quote at optimal size only if meaningfully larger than probe.
+        // Skipped on WS path — probe size is good enough and saves 2 API calls.
+        if (!skipReQuote && optimalAmount_ > minAmountIn * 1.5) {
             const buyFull = await quoteFn(pair.tokenA, pair.tokenB, optimalAmount_);
             if (buyFull?.outAmount) {
                 const fullTokenOut = BigInt(buyFull.outAmount);
@@ -263,6 +268,9 @@ class PriceScanner {
         for (const pair of this.activePairs) {
             try {
                 const result = await this.scanPair(pair, minLamports, maxLamports);
+                // Populate cache — WS triggers for this pair will reuse this result
+                // if it fires within WS_NO_OPP_TTL_MS / WS_OPP_TTL_MS
+                this._scanCache.set(pair.name, { result: result || null, timestamp: Date.now() });
                 if (result) {
                     opportunities.push(result);
                     logger.debug(
@@ -282,9 +290,27 @@ class PriceScanner {
 
     // -------------------------------------------------------
     async findOpportunitiesForPair(pair, minLamports, maxLamports) {
+        const now    = Date.now();
+        const cached = this._scanCache.get(pair.name);
+
+        if (cached) {
+            const age = now - cached.timestamp;
+            // Recent scan found no opportunity — skip Jupiter call entirely
+            if (!cached.result && age < parseInt(process.env.WS_NO_OPP_TTL_MS || '500')) {
+                logger.debug(`[Scanner] Cache skip ${pair.name} — no opp ${age}ms ago`);
+                return [];
+            }
+            // Recent scan found a profitable opportunity — use it directly
+            if (cached.result && age < parseInt(process.env.WS_OPP_TTL_MS || '300')) {
+                logger.debug(`[Scanner] Cache hit ${pair.name} — opp ${age}ms ago`);
+                return [cached.result];
+            }
+        }
+
         try {
-            // Use the WS-priority queue — never blocked by fallback full-scan calls
-            const result = await this.scanPair(pair, minLamports, maxLamports, _jupiterQuoteFast);
+            // WS-priority queue + skip re-quote (probe size is sufficient for WS triggers)
+            const result = await this.scanPair(pair, minLamports, maxLamports, _jupiterQuoteFast, true);
+            this._scanCache.set(pair.name, { result: result || null, timestamp: Date.now() });
             if (result && result.grossProfit > 0n) return [result];
         } catch (e) {
             logger.debug(`Scan error [${pair.name}]: ${e.message}`);

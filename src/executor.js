@@ -144,7 +144,7 @@ class Executor {
     //  Deduct: Jito tip + tx fees + MarginFi flashloan fee.
     // -------------------------------------------------------
     async isProfitable(grossProfit, amountIn) {
-        const minProfitUsd    = parseFloat(process.env.MIN_PROFIT_USD || this.config.MIN_PROFIT_USD || '2');
+        const minProfitUsd    = parseFloat(process.env.MIN_PROFIT_USD || this.config.MIN_PROFIT_USD || '1.5');
         const solPrice        = getSolPrice();
         const jitoTip         = BigInt(process.env.JITO_TIP_LAMPORTS  || '50000');
         const txFee           = 10000n;                           // ~2 txs × 5000 lamports
@@ -279,7 +279,7 @@ class Executor {
         const solPrice   = getSolPrice();
         const grossSol   = (Number(grossProfit) / 1e9).toFixed(6);
         const grossUsd   = (Number(grossProfit) / 1e9 * solPrice).toFixed(2);
-        const minProfUsd = parseFloat(process.env.MIN_PROFIT_USD || this.config.MIN_PROFIT_USD || '2');
+        const minProfUsd = parseFloat(process.env.MIN_PROFIT_USD || this.config.MIN_PROFIT_USD || '1.5');
 
         this.stats.oppsDetected++;
 

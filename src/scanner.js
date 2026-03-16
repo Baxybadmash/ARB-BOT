@@ -30,19 +30,28 @@ const JUPITER_QUOTE_API = process.env.JUPITER_API_KEY
 let _rateLimitedUntil = 0;
 const RATE_LIMIT_PAUSE_MS = 60 * 1000;
 
-// Serial API queue — all Jupiter calls go through here, spaced apart to avoid rate limits.
-// Default: 100ms (free tier). Set JUPITER_CALL_INTERVAL_MS=0 with a paid API key.
-const CALL_INTERVAL_MS = parseInt(process.env.JUPITER_CALL_INTERVAL_MS || '100');
-let _apiQueue = Promise.resolve();
+// Two independent API queues:
+//   _apiQueue  — fallback full-scan (all pairs, lower priority)
+//   _wsQueue   — WS single-pair scans (high priority, never blocked by fallback)
+// Default intervals: 100ms fallback, 25ms WS (free tier).
+// Set JUPITER_CALL_INTERVAL_MS=0 / JUPITER_WS_INTERVAL_MS=0 with a paid key.
+const CALL_INTERVAL_MS    = parseInt(process.env.JUPITER_CALL_INTERVAL_MS || '100');
+const WS_CALL_INTERVAL_MS = parseInt(process.env.JUPITER_WS_INTERVAL_MS   || '25');
 
-function _enqueue(fn) {
-    return new Promise((resolve, reject) => {
-        _apiQueue = _apiQueue.then(async () => {
-            try { resolve(await fn()); } catch (e) { reject(e); }
-            await new Promise(r => setTimeout(r, CALL_INTERVAL_MS));
+function _makeQueue(intervalMs) {
+    let queue = Promise.resolve();
+    return function enqueue(fn) {
+        return new Promise((resolve, reject) => {
+            queue = queue.then(async () => {
+                try { resolve(await fn()); } catch (e) { reject(e); }
+                if (intervalMs > 0) await new Promise(r => setTimeout(r, intervalMs));
+            });
         });
-    });
+    };
 }
+
+const _enqueue   = _makeQueue(CALL_INTERVAL_MS);
+const _enqueueWs = _makeQueue(WS_CALL_INTERVAL_MS);
 
 // -------------------------------------------------------
 //  DEFAULT PAIRS — all SOL-based (tokenA = SOL)
@@ -70,41 +79,49 @@ function _normalizePair(pair) {
 
 // -------------------------------------------------------
 //  JUPITER QUOTE  (rate-limit aware)
+//  _jupiterQuote     — fallback queue (100ms spacing, shared with full scan)
+//  _jupiterQuoteFast — WS queue      (25ms spacing, never blocked by fallback)
 // -------------------------------------------------------
-async function _jupiterQuote(inputMint, outputMint, amount, extraParams = {}) {
-    return _enqueue(async () => {
-        const now = Date.now();
-        if (now < _rateLimitedUntil) {
-            logger.debug(`[Scanner] Rate limited — skipping (${Math.ceil((_rateLimitedUntil - now) / 1000)}s remaining)`);
-            return null;
+async function _doQuote(inputMint, outputMint, amount, extraParams = {}) {
+    const now = Date.now();
+    if (now < _rateLimitedUntil) {
+        logger.debug(`[Scanner] Rate limited — skipping (${Math.ceil((_rateLimitedUntil - now) / 1000)}s remaining)`);
+        return null;
+    }
+    try {
+        const response = await axios.get(JUPITER_QUOTE_API, {
+            params: {
+                inputMint,
+                outputMint,
+                amount,
+                slippageBps:         parseInt(process.env.SLIPPAGE_BPS || '50'),
+                asLegacyTransaction: false,
+                maxAccounts:         parseInt(process.env.JUPITER_MAX_ACCOUNTS || '14'),
+                ...extraParams
+            },
+            timeout: 4000,
+            headers: process.env.JUPITER_API_KEY
+                ? { 'x-api-key': process.env.JUPITER_API_KEY }
+                : {},
+        });
+        return response.data;
+    } catch (e) {
+        if (e.response?.status === 429) {
+            _rateLimitedUntil = Date.now() + RATE_LIMIT_PAUSE_MS;
+            logger.warn(`[Scanner] Jupiter rate limit hit — pausing quotes for ${RATE_LIMIT_PAUSE_MS / 1000}s`);
+        } else {
+            logger.debug(`Jupiter quote error: ${e.message}`);
         }
-        try {
-            const response = await axios.get(JUPITER_QUOTE_API, {
-                params: {
-                    inputMint,
-                    outputMint,
-                    amount,
-                    slippageBps:         parseInt(process.env.SLIPPAGE_BPS || '50'),
-                    asLegacyTransaction: false,
-                    maxAccounts:         parseInt(process.env.JUPITER_MAX_ACCOUNTS || '14'),
-                    ...extraParams
-                },
-                timeout: 4000,
-                headers: process.env.JUPITER_API_KEY
-                    ? { 'x-api-key': process.env.JUPITER_API_KEY }
-                    : {},
-            });
-            return response.data;
-        } catch (e) {
-            if (e.response?.status === 429) {
-                _rateLimitedUntil = Date.now() + RATE_LIMIT_PAUSE_MS;
-                logger.warn(`[Scanner] Jupiter rate limit hit — pausing quotes for ${RATE_LIMIT_PAUSE_MS / 1000}s`);
-            } else {
-                logger.debug(`Jupiter quote error: ${e.message}`);
-            }
-            return null;
-        }
-    });
+        return null;
+    }
+}
+
+function _jupiterQuote(inputMint, outputMint, amount, extraParams = {}) {
+    return _enqueue(() => _doQuote(inputMint, outputMint, amount, extraParams));
+}
+
+function _jupiterQuoteFast(inputMint, outputMint, amount, extraParams = {}) {
+    return _enqueueWs(() => _doQuote(inputMint, outputMint, amount, extraParams));
 }
 
 // -------------------------------------------------------
@@ -153,16 +170,16 @@ class PriceScanner {
     //  Phase 2: sell at optimal size      (1 call)
     //  Total: 2 API calls per pair
     // -------------------------------------------------------
-    async scanPair(pair, minAmountIn, maxAmountIn) {
+    async scanPair(pair, minAmountIn, maxAmountIn, quoteFn = _jupiterQuote) {
         // Phase 1 — buy probe to check liquidity and spread direction
-        const buyProbe = await _jupiterQuote(pair.tokenA, pair.tokenB, minAmountIn);
+        const buyProbe = await quoteFn(pair.tokenA, pair.tokenB, minAmountIn);
         if (!buyProbe || !buyProbe.outAmount) return null;
 
         const tokenOut = BigInt(buyProbe.outAmount);
         if (tokenOut === 0n) return null;
 
         // Phase 2 — sell at same size, reverse direction
-        const sellProbe = await _jupiterQuote(pair.tokenB, pair.tokenA, tokenOut.toString());
+        const sellProbe = await quoteFn(pair.tokenB, pair.tokenA, tokenOut.toString());
         if (!sellProbe || !sellProbe.outAmount) return null;
 
         const solBack = BigInt(sellProbe.outAmount);
@@ -198,10 +215,10 @@ class PriceScanner {
 
         // Re-quote at optimal size only if meaningfully larger than probe
         if (optimalAmount_ > minAmountIn * 1.5) {
-            const buyFull = await _jupiterQuote(pair.tokenA, pair.tokenB, optimalAmount_);
+            const buyFull = await quoteFn(pair.tokenA, pair.tokenB, optimalAmount_);
             if (buyFull?.outAmount) {
                 const fullTokenOut = BigInt(buyFull.outAmount);
-                const sellFull = await _jupiterQuote(pair.tokenB, pair.tokenA, fullTokenOut.toString());
+                const sellFull = await quoteFn(pair.tokenB, pair.tokenA, fullTokenOut.toString());
                 if (sellFull?.outAmount) {
                     const fullSolBack = BigInt(sellFull.outAmount);
                     const fullProfit  = fullSolBack - BigInt(optimalAmount_);
@@ -266,7 +283,8 @@ class PriceScanner {
     // -------------------------------------------------------
     async findOpportunitiesForPair(pair, minLamports, maxLamports) {
         try {
-            const result = await this.scanPair(pair, minLamports, maxLamports);
+            // Use the WS-priority queue — never blocked by fallback full-scan calls
+            const result = await this.scanPair(pair, minLamports, maxLamports, _jupiterQuoteFast);
             if (result && result.grossProfit > 0n) return [result];
         } catch (e) {
             logger.debug(`Scan error [${pair.name}]: ${e.message}`);

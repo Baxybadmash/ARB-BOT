@@ -128,7 +128,7 @@ async function startBot() {
     const wallet     = loadWallet();
     const config     = {
         MARGINFI_GROUP:       process.env.MARGINFI_GROUP,
-        MIN_PROFIT_USD:       parseFloat(process.env.MIN_PROFIT_USD || '2'),
+        MIN_PROFIT_USD:       parseFloat(process.env.MIN_PROFIT_USD || '1.5'),
         FLASHLOAN_AMOUNT_SOL: parseFloat(process.env.FLASHLOAN_AMOUNT_SOL || '100'),
         SLIPPAGE_BPS:         parseInt(process.env.SLIPPAGE_BPS || '50'),
     };

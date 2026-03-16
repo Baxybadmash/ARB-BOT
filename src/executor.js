@@ -140,6 +140,13 @@ class Executor {
         const minProfitLamports = BigInt(Math.ceil((minProfitUsd / solPrice) * 1e9));
         const totalCosts        = jitoTip + txFee + flashloanFee;
 
+        // Guard: spread must exceed slippage tolerance on both legs, otherwise Jupiter
+        // will revert with SlippageToleranceExceeded (0x1788) if price ticks even slightly.
+        // Require spread > 2× slippage so the net profit survives worst-case slippage.
+        const slippageBps      = parseInt(process.env.SLIPPAGE_BPS || this.config.SLIPPAGE_BPS || '50');
+        const minSpreadLamports = BigInt(Math.ceil(Number(amountIn) * (slippageBps * 2) / 10000));
+        if (grossProfit <= minSpreadLamports) return false;
+
         return grossProfit > minProfitLamports + totalCosts;
     }
 

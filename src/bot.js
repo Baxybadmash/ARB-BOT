@@ -180,7 +180,7 @@ async function startBot() {
     let isExecuting  = false;
     let isScanning   = false;   // prevents overlapping fallback full-scans (scan takes ~3.7s)
     const lastWsScan = new Map(); // pair.name → timestamp, prevents WS burst
-    const WS_DEBOUNCE_MS = 500;  // min 500ms between scans of the same pair via WS
+    const WS_DEBOUNCE_MS = parseInt(process.env.WS_DEBOUNCE_MS || '2000');  // min gap between WS scans of same pair
 
     // Shared execute helper — used by both WS trigger and slot fallback
     async function tryExecute(opportunities, label) {

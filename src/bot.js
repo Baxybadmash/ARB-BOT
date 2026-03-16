@@ -179,6 +179,7 @@ async function startBot() {
     let lastSlotTime = Date.now();
     let isExecuting  = false;
     let isScanning   = false;   // prevents overlapping fallback full-scans (scan takes ~3.7s)
+    let isWsScanning = false;   // serializes WS scans — prevents queue stacking when multiple pairs fire simultaneously
     const lastWsScan = new Map(); // pair.name → timestamp, prevents WS burst
     const WS_DEBOUNCE_MS = parseInt(process.env.WS_DEBOUNCE_MS || '2000');  // min gap between WS scans of same pair
 
@@ -216,13 +217,18 @@ async function startBot() {
     //  Fires immediately when a pool swap changes reserves.
     // -------------------------------------------------------
     const wsCallback = async (pair) => {
-        if (isExecuting) return;
+        if (isExecuting || isWsScanning) return;
         const now = Date.now();
         if (now - (lastWsScan.get(pair.name) || 0) < WS_DEBOUNCE_MS) return;
         lastWsScan.set(pair.name, now);
+        isWsScanning = true;
         executor.stats.slotsScanned++;
-        const opps = await scanner.findOpportunitiesForPair(pair, minFlashloanLamports, flashloanLamports);
-        await tryExecute(opps, 'WS', now);
+        try {
+            const opps = await scanner.findOpportunitiesForPair(pair, minFlashloanLamports, flashloanLamports);
+            await tryExecute(opps, 'WS', now);
+        } finally {
+            isWsScanning = false;
+        }
     };
 
     const poolWatcher = new PoolWatcher(connection);

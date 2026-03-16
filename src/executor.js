@@ -22,7 +22,6 @@ const fs           = require('fs');
 const { getSolPrice } = require('./price');
 const path   = require('path');
 const logger = require('./logger');
-const telegram = require('./telegram');
 const discord  = require('./discord');
 
 // -------------------------------------------------------
@@ -478,7 +477,6 @@ class Executor {
                 this.stats.txSuccess++;
                 this.stats.totalProfit += grossProfit;
                 logger.info(`✅ FLASHLOAN SENT | Profit: ~$${profitUsd} | Bundle: ${bundleId}`);
-                telegram.alertTrade(profitUsd, pair.name, bundleId).catch(() => {});
                 discord.alertTrade(profitUsd, pair.name, bundleId).catch(() => {});
                 return true;
             }
@@ -513,7 +511,6 @@ class Executor {
                 this.stats.txSuccess++;
                 this.stats.totalProfit += grossProfit;
                 logger.info(`✅ FLASHLOAN TX confirmed (direct): ${sig} | Profit: ~$${profitUsd}`);
-                telegram.alertTrade(profitUsd, pair.name, sig).catch(() => {});
                 discord.alertTrade(profitUsd, pair.name, sig).catch(() => {});
                 return true;
             } catch (confirmErr) {
@@ -524,7 +521,6 @@ class Executor {
 
         } catch (e) {
             logger.error(`[Executor] Execution error: ${e.message}`);
-            telegram.alertError(`Flashloan failed: ${e.message}`).catch(() => {});
             discord.alertError(`Flashloan failed: ${e.message}`).catch(() => {});
             return false;
         }

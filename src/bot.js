@@ -15,7 +15,6 @@ const { updatePairs, isUpdateDue, getUpdateStatus } = require('./pairUpdater');
 const { findOptimalLoanSize }                       = require('./loanSizer');
 const { PoolWatcher }                               = require('./poolWatcher');
 const logger                              = require('./logger');
-const telegram                            = require('./telegram');
 const discord                             = require('./discord');
 const { initPriceStream, getSolPrice }     = require('./price');
 
@@ -90,13 +89,12 @@ function startUpdateScheduler(scanner, flashloanLamports, poolWatcher, wsCallbac
         logger.info('[Scheduler] Monthly pair update is due — starting...');
 
         try {
-            await updatePairs(flashloanLamports, telegram.send.bind(telegram), discord.send.bind(discord));
+            await updatePairs(flashloanLamports, null, discord.send.bind(discord));
             scanner.reloadPairs(); // hot-swap pair list without restart
             await poolWatcher.resubscribe(scanner.activePairs, wsCallback); // resync WS subscriptions
             logger.info('[Scheduler] Pairs updated, reloaded, and WS resubscribed ✅');
         } catch (e) {
             logger.error(`[Scheduler] Pair update failed: ${e.message}`);
-            await telegram.alertError(`Monthly pair update failed: ${e.message}`);
             await discord.alertError(`Monthly pair update failed: ${e.message}`);
         }
     };
@@ -120,7 +118,6 @@ async function startBot() {
     logger.info('  🤖 SOLANA FLASHLOAN ARB BOT — STARTING');
     logger.info('═'.repeat(60));
 
-    telegram.init();
     discord.init();
     initPriceStream();
 
@@ -172,7 +169,6 @@ async function startBot() {
     logger.info(`Min profit:      $${config.MIN_PROFIT_USD}`);
     logger.info('');
 
-    await telegram.alertStartup(wallet.publicKey.toString());
     await discord.alertStartup(wallet.publicKey.toString());
 
     let lastSlot     = 0;
@@ -314,7 +310,6 @@ async function startBot() {
         if (subscriptionId !== null) {
             try { connection.removeSlotChangeListener(subscriptionId); } catch (_) {}
         }
-        await telegram.alertOffline();
         await discord.alertOffline();
         process.exit(0);
     }
@@ -324,7 +319,7 @@ async function startBot() {
     // Await alerts before exit so Telegram/Discord receive the message
     process.on('uncaughtException', async (e) => {
         logger.error(`Uncaught: ${e.message}`);
-        await Promise.allSettled([telegram.alertError(e.message), discord.alertError(e.message)]);
+        await discord.alertError(e.message);
         process.exit(1);
     });
     process.on('unhandledRejection', (r) => { logger.error(`Unhandled rejection: ${r}`); });

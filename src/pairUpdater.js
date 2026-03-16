@@ -270,7 +270,7 @@ function buildPair(token) {
 // -------------------------------------------------------
 //  MAIN UPDATE FUNCTION
 // -------------------------------------------------------
-async function updatePairs(flashloanLamports, telegramAlert = null, discordAlert = null) {
+async function updatePairs(flashloanLamports, _unused = null, discordAlert = null) {
     logger.info('');
     logger.info('═'.repeat(50));
     logger.info('  🔄 MONTHLY PAIR UPDATE STARTING');
@@ -293,8 +293,7 @@ async function updatePairs(flashloanLamports, telegramAlert = null, discordAlert
 
     if (topTokens.length === 0) {
         logger.warn('[PairUpdater] No tokens fetched — keeping existing pairs');
-        if (telegramAlert) await telegramAlert('⚠️ *Monthly pair update failed* — keeping existing pairs. Check Birdeye API.');
-        if (discordAlert)  await discordAlert('⚠️ **Monthly pair update failed** — keeping existing pairs. Check Birdeye API.');
+        if (discordAlert) await discordAlert('⚠️ **Monthly pair update failed** — keeping existing pairs. Check Birdeye API.');
         return loadPairs();
     }
 
@@ -369,28 +368,12 @@ async function updatePairs(flashloanLamports, telegramAlert = null, discordAlert
     });
     logger.info('');
 
-    // Telegram alert
-    if (telegramAlert || discordAlert) {
+    if (discordAlert) {
         const pairList  = newPairs.map((p, i) => `${i + 1}. ${p.name}`).join('\n');
         const topScores = topCandidates.slice(0, 3)
             .map(t => `${t.symbol}: score ${t.totalScore.toFixed(3)}, vol $${Math.round(t.volume24h/1000)}k`)
             .join('\n');
         const nextDate  = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toLocaleDateString('en-IN');
-
-        if (telegramAlert) {
-            await telegramAlert(
-`🔄 *Monthly Pair Update Complete*
-📊 Active pairs: ${newPairs.length}
-
-*New pair list:*
-${pairList}
-
-*Top new additions by score:*
-${topScores}
-
-_Next update: ${nextDate}_`
-            );
-        }
 
         if (discordAlert) {
             await discordAlert(

@@ -16,7 +16,7 @@
 // ============================================================
 const { MarginfiClient, MarginfiAccountWrapper, getConfig } = require('@mrgnlabs/marginfi-client-v2');
 const { NodeWallet }      = require('@mrgnlabs/mrgn-common');
-const { Connection, PublicKey, TransactionInstruction } = require('@solana/web3.js');
+const { Connection, PublicKey, TransactionInstruction, SystemProgram } = require('@solana/web3.js');
 const axios        = require('axios');
 const fs           = require('fs');
 const { getSolPrice } = require('./price');
@@ -31,6 +31,19 @@ const discord  = require('./discord');
 // swap-instructions endpoint rejects API key with 401 — use lite-api directly
 const JUPITER_SWAP_API  = 'https://lite-api.jup.ag/swap/v1';
 const JITO_BUNDLE_URL   = `${process.env.JITO_BLOCK_ENGINE_URL || 'https://mainnet.block-engine.jito.labs.io'}/api/v1/bundles`;
+
+// Jito tip accounts — one is picked per bundle submission
+// Source: https://jito-labs.gitbook.io/mev/searcher-resources/bundles
+const JITO_TIP_ACCOUNTS = [
+    '96gYZGLnJYVFmbjzopPSU6QiEV5fGqZNyN9nmNhvrZU5',
+    'HFqU5x63VTqvQss8hp11i4wVV8bD44PvwucfZ2bU7gRe',
+    'Cw8CFyM9FkoMi7K7Crf6HNQqf4uEMzpKw6QNghXLvLkY',
+    'ADaUMid9yfUytqMBgopwjb2DTLSokTSzL1zcaozNr7RD',
+    'DfXygSm4jCyNCybVYYK6DwvWqjKee8pbDmJGcLWNDXjh',
+    'ADuUkR4vqLUMWXxW9gh6D6L8pMSawimctcNZ5pGwDcEt',
+    'DttWaMuVvTiduZRnguLF7jNxTgiMBZ1hyAumKUiL2KRL',
+    '3AVi9Tg9Uo68tJfuvoKvqKNWKkC5wPdSSdeBnizKZ6jT',
+];
 
 // MarginFi production SOL bank
 // Source: https://storage.googleapis.com/mrgn-public/mrgn-bank-metadata-cache.json
@@ -157,11 +170,13 @@ class Executor {
     //  and including it adds a SetComputeUnitPrice ix that wastes tx bytes.
     // -------------------------------------------------------
     async _getSwapInstructions(quoteResponse) {
+        const slippageBps = parseInt(process.env.SLIPPAGE_BPS || this.config.SLIPPAGE_BPS || '50');
         const params = {
             quoteResponse,
             userPublicKey:           this.wallet.publicKey.toString(),
             wrapAndUnwrapSol:        false,   // wSOL is managed by MarginFi borrow/repay
             dynamicComputeUnitLimit: true,
+            slippageBps,
         };
         const res = await axios.post(`${JUPITER_SWAP_API}/swap-instructions`, params, { timeout: 6000 });
         return res.data;
@@ -243,7 +258,8 @@ class Executor {
             }, { timeout: 10000 });
             return res.data.result;
         } catch (e) {
-            logger.warn(`[Executor] Jito bundle failed: ${e.message}`);
+            const detail = e.response?.data?.error?.message || e.response?.data?.message || e.message;
+            logger.warn(`[Executor] Jito bundle failed: ${detail}`);
             return null;
         }
     }
@@ -332,7 +348,19 @@ class Executor {
                 return !seenSetup.has(key);
             });
 
+            // Jito tip instruction — required for bundle acceptance
+            const jitoTipLamports = BigInt(process.env.JITO_TIP_LAMPORTS || '50000');
+            const jitoTipAccount  = new PublicKey(
+                JITO_TIP_ACCOUNTS[Math.floor(Math.random() * JITO_TIP_ACCOUNTS.length)]
+            );
+            const jitoTipIx = SystemProgram.transfer({
+                fromPubkey: this.wallet.publicKey,
+                toPubkey:   jitoTipAccount,
+                lamports:   jitoTipLamports,
+            });
+
             const innerIxs = [
+                jitoTipIx,
                 ...(borrowWrapper.instructions || []),
                 ...computeBudgetIxs,
                 ...buySetupIxs,

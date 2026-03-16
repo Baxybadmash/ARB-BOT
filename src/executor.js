@@ -32,7 +32,6 @@ const BORROW_DISCRIMINATOR = Buffer.from([0x04, 0x7e, 0x74, 0x35, 0x30, 0x05, 0x
 const REPAY_DISCRIMINATOR  = Buffer.from([0x4f, 0xd1, 0xac, 0xb1, 0xde, 0x33, 0xad, 0x97]); // lendingAccountRepay
 // swap-instructions endpoint rejects API key with 401 — use lite-api directly
 const JUPITER_SWAP_API  = 'https://lite-api.jup.ag/swap/v1';
-const JITO_BUNDLE_URL   = `${process.env.JITO_BLOCK_ENGINE_URL || 'https://mainnet.block-engine.jito.labs.io'}/api/v1/bundles`;
 
 // Jito tip accounts — one is picked per bundle submission
 // Source: https://jito-labs.gitbook.io/mev/searcher-resources/bundles
@@ -56,6 +55,7 @@ const FLASHLOAN_FEE_BPS = 0n;
 
 const DATA_DIR          = path.join(__dirname, '..', 'data');
 const MFI_ACCOUNT_FILE  = path.join(DATA_DIR, 'marginfi_account.json');
+const LUT_CACHE_TTL_MS  = 5 * 60 * 1000; // LUTs are stable; 5-min TTL saves ~75ms per execution
 
 // -------------------------------------------------------
 class Executor {
@@ -73,6 +73,9 @@ class Executor {
             txSuccess:     0,
             totalProfit:   0n,
         };
+        this._lutCache     = new Map(); // key: sorted LUT addrs, value: { tables, cachedAt }
+        this._blockhashCache = null;    // { blockhash, lastValidBlockHeight } — refreshed every 500ms
+        this._swapIxCache  = new Map(); // key: quote fingerprint, value: swap instructions response
     }
 
     // -------------------------------------------------------
@@ -129,6 +132,26 @@ class Executor {
             programId: ix.programId, keys: ix.keys, data: Buffer.from(ix.data),
         }));
         logger.info('[Executor] MFI instruction templates cached ✅');
+
+        this._startBlockhashCache();
+    }
+
+    // -------------------------------------------------------
+    //  BLOCKHASH CACHE — refreshes every 500ms in background
+    //  Eliminates the ~75ms getLatestBlockhash call from the
+    //  critical path on every trade.
+    // -------------------------------------------------------
+    _startBlockhashCache() {
+        const refresh = async () => {
+            try {
+                this._blockhashCache = await this.connection.getLatestBlockhash('processed');
+            } catch (e) {
+                logger.debug(`[Executor] Blockhash refresh failed: ${e.message}`);
+            }
+        };
+        refresh(); // warm up immediately
+        setInterval(refresh, 500);
+        logger.info('[Executor] Blockhash cache started (refresh every 500ms) ✅');
     }
 
     // -------------------------------------------------------
@@ -232,6 +255,10 @@ class Executor {
     //  and including it adds a SetComputeUnitPrice ix that wastes tx bytes.
     // -------------------------------------------------------
     async _getSwapInstructions(quoteResponse) {
+        // Cache keyed by quote fingerprint — same route/amounts → same instructions
+        const key = `${quoteResponse.inputMint}:${quoteResponse.outputMint}:${quoteResponse.inAmount}:${quoteResponse.outAmount}`;
+        if (this._swapIxCache.has(key)) return this._swapIxCache.get(key);
+
         const slippageBps = parseInt(process.env.SLIPPAGE_BPS || this.config.SLIPPAGE_BPS || '50');
         const params = {
             quoteResponse,
@@ -241,6 +268,11 @@ class Executor {
             slippageBps,
         };
         const res = await axios.post(`${JUPITER_SWAP_API}/swap-instructions`, params, { timeout: 6000 });
+
+        this._swapIxCache.set(key, res.data);
+        if (this._swapIxCache.size > 20) {
+            this._swapIxCache.delete(this._swapIxCache.keys().next().value); // evict oldest
+        }
         return res.data;
     }
 
@@ -296,6 +328,10 @@ class Executor {
     // -------------------------------------------------------
     async _loadLookupTables(addresses) {
         if (!addresses || addresses.length === 0) return [];
+        const key    = [...addresses].sort().join(',');
+        const cached = this._lutCache.get(key);
+        if (cached && Date.now() - cached.cachedAt < LUT_CACHE_TTL_MS) return cached.tables;
+
         const results = await Promise.all(
             addresses.map(addr =>
                 this.connection
@@ -304,26 +340,37 @@ class Executor {
                     .catch(() => null)
             )
         );
-        return results.filter(Boolean);
+        const tables = results.filter(Boolean);
+        this._lutCache.set(key, { tables, cachedAt: Date.now() });
+        return tables;
     }
 
     // -------------------------------------------------------
     //  SUBMIT VIA JITO BUNDLE
     // -------------------------------------------------------
     async _submitJitoBundle(serializedTxs) {
-        try {
-            const res = await axios.post(JITO_BUNDLE_URL, {
-                jsonrpc: '2.0',
-                id:      1,
-                method:  'sendBundle',
-                params:  [serializedTxs],
-            }, { timeout: 3000 });
-            return res.data.result;
-        } catch (e) {
+        // Submit to multiple Jito regions simultaneously — first accepted wins.
+        // Frankfurt (~0ms from VPS) + Amsterdam (~10ms) for EU coverage.
+        const primary   = process.env.JITO_BLOCK_ENGINE_URL || 'https://frankfurt.mainnet.block-engine.jito.wtf';
+        const endpoints = [...new Set([primary, 'https://amsterdam.mainnet.block-engine.jito.wtf'])]
+            .map(url => `${url}/api/v1/bundles`);
+
+        const payload = { jsonrpc: '2.0', id: 1, method: 'sendBundle', params: [serializedTxs] };
+        const results  = await Promise.allSettled(
+            endpoints.map(url => axios.post(url, payload, { timeout: 3000 }))
+        );
+
+        for (const r of results) {
+            if (r.status === 'fulfilled' && r.value?.data?.result) return r.value.data.result;
+        }
+
+        const fail = results.find(r => r.status === 'rejected');
+        if (fail) {
+            const e      = fail.reason;
             const detail = e.response?.data?.error?.message || e.response?.data?.message || e.message;
             logger.warn(`[Executor] Jito bundle failed: ${detail}`);
-            return null;
         }
+        return null;
     }
 
     // -------------------------------------------------------
@@ -367,16 +414,14 @@ class Executor {
             const [borrowWrapper, repayWrapper] = this._buildMfiIxs(amountLamports);
 
             // ── Steps 2+blockhash [PARALLEL] ────────────────────────────
-            //  Jupiter swap ixs and blockhash have no mutual dependencies.
-            const [
-                [buyIxData, sellIxData],
-                { blockhash, lastValidBlockHeight: _lvbh },
-            ] = await Promise.all([
-                Promise.all([
-                    this._getSwapInstructions(bestBuyQuote),
-                    this._getSwapInstructions(reverseQuote),
-                ]),
-                this.connection.getLatestBlockhash('confirmed'),
+            //  Blockhash is served from in-memory cache (refreshed every 500ms)
+            //  so both swap-ix calls run with no RPC dependency alongside them.
+            const { blockhash, lastValidBlockHeight } =
+                this._blockhashCache || await this.connection.getLatestBlockhash('processed');
+
+            const [buyIxData, sellIxData] = await Promise.all([
+                this._getSwapInstructions(bestBuyQuote),
+                this._getSwapInstructions(reverseQuote),
             ]);
 
             // ── Step 3: Collect address lookup tables ─────────────────
@@ -467,57 +512,55 @@ class Executor {
             }
             logger.debug(`[Executor] Tx size: ${serializedBuf.length} bytes`);
 
-            // ── Step 7: Submit via Jito ───────────────────────────────
-            const serialized = serializedBuf.toString('base64');
-            const bundleId   = await this._submitJitoBundle([serialized]);
+            // ── Step 7: Submit via Jito + direct RPC simultaneously ──────
+            // Both fire with the same signed tx — on-chain it's idempotent (same sig).
+            // Eliminates the old 3s Jito-wait before fallback. No re-sign needed.
+            const serialized  = serializedBuf.toString('base64');
+            const jitoP       = this._submitJitoBundle([serialized]);
+            const directP     = this.connection.sendRawTransaction(serializedBuf, {
+                skipPreflight: true,
+                maxRetries:    parseInt(process.env.MAX_RETRIES || '3'),
+            }).catch(e => { logger.debug(`[Executor] Direct send error: ${e.message}`); return null; });
+
+            const [bundleId, directSig] = await Promise.all([jitoP, directP]);
+            this.stats.txSent++;
 
             if (bundleId) {
-                this.stats.txSent++;
-                // Bundle accepted by Jito — treat as success (bundle ID = commitment)
                 this.stats.txSuccess++;
                 this.stats.totalProfit += grossProfit;
-                logger.info(`✅ FLASHLOAN SENT | Profit: ~$${profitUsd} | Bundle: ${bundleId}`);
+                logger.info(`✅ FLASHLOAN SENT | Profit: ~$${profitUsd} | Bundle: ${bundleId}${directSig ? ` | Direct: ${directSig}` : ''}`);
                 discord.alertTrade(profitUsd, pair.name, bundleId).catch(() => {});
                 return true;
             }
 
-            // Fallback: direct submission if Jito unavailable
-            // Re-fetch blockhash + re-sign — the Jito attempt consumed up to 3s so the
-            // original blockhash may be aged and the quote is closer to expiry.
-            discord.alertJitoFallback(pair.name).catch(() => {});
-            const { blockhash: freshBlockhash, lastValidBlockHeight } =
-                await this.connection.getLatestBlockhash('confirmed');
-            flashTx.message.recentBlockhash = freshBlockhash;
-            flashTx.sign([this.wallet]);
-
-            const sig = await this.connection.sendRawTransaction(flashTx.serialize(), {
-                skipPreflight: true,  // skip RPC simulation — saves ~80ms, tx validated on-chain
-                maxRetries:    parseInt(process.env.MAX_RETRIES || '3'),
-            });
-            this.stats.txSent++;
-            logger.info(`[Executor] Direct tx sent: ${sig} — awaiting confirmation...`);
-
-            try {
-                const result = await this.connection.confirmTransaction(
-                    { signature: sig, blockhash: freshBlockhash, lastValidBlockHeight },
-                    'confirmed'
-                );
-                if (result.value.err) {
-                    const reason = JSON.stringify(result.value.err);
-                    logger.error(`[Executor] Direct tx failed on-chain: ${reason}`);
-                    discord.alertTxFailed(pair.name, reason).catch(() => {});
+            if (directSig) {
+                discord.alertJitoFallback(pair.name).catch(() => {});
+                logger.info(`[Executor] Jito rejected — direct tx: ${directSig} — awaiting confirmation...`);
+                try {
+                    const result = await this.connection.confirmTransaction(
+                        { signature: directSig, blockhash, lastValidBlockHeight },
+                        'confirmed'
+                    );
+                    if (result.value.err) {
+                        const reason = JSON.stringify(result.value.err);
+                        logger.error(`[Executor] Direct tx failed on-chain: ${reason}`);
+                        discord.alertTxFailed(pair.name, reason).catch(() => {});
+                        return false;
+                    }
+                    this.stats.txSuccess++;
+                    this.stats.totalProfit += grossProfit;
+                    logger.info(`✅ FLASHLOAN confirmed (direct): ${directSig} | Profit: ~$${profitUsd}`);
+                    discord.alertTrade(profitUsd, pair.name, directSig).catch(() => {});
+                    return true;
+                } catch (confirmErr) {
+                    logger.error(`[Executor] Direct tx confirmation failed: ${confirmErr.message}`);
+                    discord.alertTxFailed(pair.name, confirmErr.message).catch(() => {});
                     return false;
                 }
-                this.stats.txSuccess++;
-                this.stats.totalProfit += grossProfit;
-                logger.info(`✅ FLASHLOAN TX confirmed (direct): ${sig} | Profit: ~$${profitUsd}`);
-                discord.alertTrade(profitUsd, pair.name, sig).catch(() => {});
-                return true;
-            } catch (confirmErr) {
-                logger.error(`[Executor] Direct tx confirmation failed: ${confirmErr.message}`);
-                discord.alertTxFailed(pair.name, confirmErr.message).catch(() => {});
-                return false;
             }
+
+            logger.warn(`[Executor] Both Jito and direct submission failed`);
+            return false;
 
         } catch (e) {
             logger.error(`[Executor] Execution error: ${e.message}`);

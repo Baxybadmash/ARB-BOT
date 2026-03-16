@@ -30,28 +30,25 @@ const JUPITER_QUOTE_API = process.env.JUPITER_API_KEY
 let _rateLimitedUntil = 0;
 const RATE_LIMIT_PAUSE_MS = 60 * 1000;
 
-// Two independent API queues:
-//   _apiQueue  — fallback full-scan (all pairs, lower priority)
-//   _wsQueue   — WS single-pair scans (high priority, never blocked by fallback)
-// Default intervals: 100ms fallback, 25ms WS (free tier).
-// Set JUPITER_CALL_INTERVAL_MS=0 / JUPITER_WS_INTERVAL_MS=0 with a paid key.
-const CALL_INTERVAL_MS    = parseInt(process.env.JUPITER_CALL_INTERVAL_MS || '100');
-const WS_CALL_INTERVAL_MS = parseInt(process.env.JUPITER_WS_INTERVAL_MS   || '25');
+// Shared rate limiter — both WS and fallback paths draw from the same token bucket.
+// Prevents combined rate from exceeding Jupiter paid tier (600 req/min = 10/sec).
+// Default: 8/sec = 480/min (20% headroom). Override with JUPITER_RATE_LIMIT_PER_SEC.
+const RATE_LIMIT_PER_SEC = parseInt(process.env.JUPITER_RATE_LIMIT_PER_SEC || '8');
+const MIN_GAP_MS         = Math.ceil(1000 / RATE_LIMIT_PER_SEC); // 125ms at 8/sec
 
-function _makeQueue(intervalMs) {
-    let queue = Promise.resolve();
-    return function enqueue(fn) {
-        return new Promise((resolve, reject) => {
-            queue = queue.then(async () => {
-                try { resolve(await fn()); } catch (e) { reject(e); }
-                if (intervalMs > 0) await new Promise(r => setTimeout(r, intervalMs));
-            });
+let _lastCallTime     = 0;
+let _rateLimiterQueue = Promise.resolve();
+
+function _enqueueCall(fn) {
+    return new Promise((resolve, reject) => {
+        _rateLimiterQueue = _rateLimiterQueue.then(async () => {
+            const wait = Math.max(0, _lastCallTime + MIN_GAP_MS - Date.now());
+            if (wait > 0) await new Promise(r => setTimeout(r, wait));
+            _lastCallTime = Date.now();
+            try { resolve(await fn()); } catch (e) { reject(e); }
         });
-    };
+    });
 }
-
-const _enqueue   = _makeQueue(CALL_INTERVAL_MS);
-const _enqueueWs = _makeQueue(WS_CALL_INTERVAL_MS);
 
 // -------------------------------------------------------
 //  DEFAULT PAIRS — all SOL-based (tokenA = SOL)
@@ -117,11 +114,11 @@ async function _doQuote(inputMint, outputMint, amount, extraParams = {}) {
 }
 
 function _jupiterQuote(inputMint, outputMint, amount, extraParams = {}) {
-    return _enqueue(() => _doQuote(inputMint, outputMint, amount, extraParams));
+    return _enqueueCall(() => _doQuote(inputMint, outputMint, amount, extraParams));
 }
 
 function _jupiterQuoteFast(inputMint, outputMint, amount, extraParams = {}) {
-    return _enqueueWs(() => _doQuote(inputMint, outputMint, amount, extraParams));
+    return _enqueueCall(() => _doQuote(inputMint, outputMint, amount, extraParams));
 }
 
 // -------------------------------------------------------

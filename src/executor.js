@@ -285,7 +285,7 @@ class Executor {
 
         if (!await this.isProfitable(grossProfit, amountIn)) {
             logger.info(`[Executor] Below min profit — gross: ${grossSol} SOL (~$${grossUsd}) | pair: ${pair.name}`);
-            await discord.alertBelowMinProfit(pair.name, grossSol, grossUsd, minProfUsd);
+            discord.alertBelowMinProfit(pair.name, grossSol, grossUsd, minProfUsd).catch(() => {});
             return false;
         }
 
@@ -296,7 +296,8 @@ class Executor {
             `🎯 EXECUTING — ${pair.name} | spread: ${opportunity.priceDiffPct}% | ` +
             `loan: ${opportunity.loanSizeSol?.toFixed(1)} SOL | profit: ~$${profitUsd}`
         );
-        await discord.alertExecuting(pair.name, opportunity.priceDiffPct, opportunity.loanSizeSol?.toFixed(1), profitUsd);
+        // Fire-and-forget — do not await Discord before building tx
+        discord.alertExecuting(pair.name, opportunity.priceDiffPct, opportunity.loanSizeSol?.toFixed(1), profitUsd).catch(() => {});
 
         try {
             const borrowAmountSol = Number(amountIn) / 1e9;
@@ -419,15 +420,15 @@ class Executor {
                 this.stats.txSuccess++;
                 this.stats.totalProfit += grossProfit;
                 logger.info(`✅ FLASHLOAN SENT | Profit: ~$${profitUsd} | Bundle: ${bundleId}`);
-                await telegram.alertTrade(profitUsd, pair.name, bundleId);
-                await discord.alertTrade(profitUsd, pair.name, bundleId);
+                telegram.alertTrade(profitUsd, pair.name, bundleId).catch(() => {});
+                discord.alertTrade(profitUsd, pair.name, bundleId).catch(() => {});
                 return true;
             }
 
             // Fallback: direct submission if Jito unavailable
             // Re-fetch blockhash + re-sign — the Jito attempt consumed up to 3s so the
             // original blockhash may be aged and the quote is closer to expiry.
-            await discord.alertJitoFallback(pair.name);
+            discord.alertJitoFallback(pair.name).catch(() => {});
             const { blockhash: freshBlockhash, lastValidBlockHeight } =
                 await this.connection.getLatestBlockhash('confirmed');
             flashTx.message.recentBlockhash = freshBlockhash;
@@ -448,25 +449,25 @@ class Executor {
                 if (result.value.err) {
                     const reason = JSON.stringify(result.value.err);
                     logger.error(`[Executor] Direct tx failed on-chain: ${reason}`);
-                    await discord.alertTxFailed(pair.name, reason);
+                    discord.alertTxFailed(pair.name, reason).catch(() => {});
                     return false;
                 }
                 this.stats.txSuccess++;
                 this.stats.totalProfit += grossProfit;
                 logger.info(`✅ FLASHLOAN TX confirmed (direct): ${sig} | Profit: ~$${profitUsd}`);
-                await telegram.alertTrade(profitUsd, pair.name, sig);
-                await discord.alertTrade(profitUsd, pair.name, sig);
+                telegram.alertTrade(profitUsd, pair.name, sig).catch(() => {});
+                discord.alertTrade(profitUsd, pair.name, sig).catch(() => {});
                 return true;
             } catch (confirmErr) {
                 logger.error(`[Executor] Direct tx confirmation failed: ${confirmErr.message}`);
-                await discord.alertTxFailed(pair.name, confirmErr.message);
+                discord.alertTxFailed(pair.name, confirmErr.message).catch(() => {});
                 return false;
             }
 
         } catch (e) {
             logger.error(`[Executor] Execution error: ${e.message}`);
-            await telegram.alertError(`Flashloan failed: ${e.message}`);
-            await discord.alertError(`Flashloan failed: ${e.message}`);
+            telegram.alertError(`Flashloan failed: ${e.message}`).catch(() => {});
+            discord.alertError(`Flashloan failed: ${e.message}`).catch(() => {});
             return false;
         }
     }

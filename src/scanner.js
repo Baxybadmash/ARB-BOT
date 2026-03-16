@@ -30,9 +30,9 @@ const JUPITER_QUOTE_API = process.env.JUPITER_API_KEY
 let _rateLimitedUntil = 0;
 const RATE_LIMIT_PAUSE_MS = 60 * 1000;
 
-// Serial API queue — all Jupiter calls go through here, spaced 150ms apart.
-// This guarantees ≤6.7 calls/sec regardless of how many concurrent scans fire.
-const CALL_INTERVAL_MS = parseInt(process.env.JUPITER_CALL_INTERVAL_MS || '150');
+// Serial API queue — all Jupiter calls go through here, spaced apart to avoid rate limits.
+// Default: 100ms (free tier). Set JUPITER_CALL_INTERVAL_MS=0 with a paid API key.
+const CALL_INTERVAL_MS = parseInt(process.env.JUPITER_CALL_INTERVAL_MS || '100');
 let _apiQueue = Promise.resolve();
 
 function _enqueue(fn) {

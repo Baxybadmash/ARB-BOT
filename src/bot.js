@@ -128,7 +128,7 @@ async function startBot() {
     const wallet     = loadWallet();
     const config     = {
         MARGINFI_GROUP:       process.env.MARGINFI_GROUP,
-        MIN_PROFIT_USD:       parseFloat(process.env.MIN_PROFIT_USD || '5'),
+        MIN_PROFIT_USD:       parseFloat(process.env.MIN_PROFIT_USD || '1.5'),
         FLASHLOAN_AMOUNT_SOL: parseFloat(process.env.FLASHLOAN_AMOUNT_SOL || '100'),
         SLIPPAGE_BPS:         parseInt(process.env.SLIPPAGE_BPS || '50'),
     };
@@ -183,7 +183,7 @@ async function startBot() {
     const WS_DEBOUNCE_MS = parseInt(process.env.WS_DEBOUNCE_MS || '2000');  // min gap between WS scans of same pair
 
     // Shared execute helper — used by both WS trigger and slot fallback
-    async function tryExecute(opportunities, label) {
+    async function tryExecute(opportunities, label, triggerTime) {
         if (opportunities.length === 0) return;
         if (isExecuting) return;
 
@@ -197,8 +197,13 @@ async function startBot() {
                     finalOpp = { ...top, ...refined, loanSizeSol: refined.size / 1e9, amountIn: BigInt(refined.size) };
                 }
             }
-            logger.info(`[${label}] Opportunity: ${top.pair.name} | spread: ${top.priceDiffPct}% | loan: ${top.loanSizeSol?.toFixed(1)} SOL`);
+            const scanMs = triggerTime ? Date.now() - triggerTime : null;
+            logger.info(`[${label}] Opportunity: ${top.pair.name} | spread: ${top.priceDiffPct}% | loan: ${top.loanSizeSol?.toFixed(1)} SOL${scanMs !== null ? ` | scan: ${scanMs}ms` : ''}`);
+            const execStart = Date.now();
             await executor.execute(finalOpp);
+            const execMs = Date.now() - execStart;
+            const totalMs = triggerTime ? Date.now() - triggerTime : null;
+            logger.info(`[${label}] Latency — scan: ${scanMs ?? '?'}ms | exec: ${execMs}ms${totalMs !== null ? ` | total: ${totalMs}ms` : ''}`);
         } catch (e) {
             logger.error(`[${label}] Execution error: ${e.message}`);
         } finally {
@@ -217,7 +222,7 @@ async function startBot() {
         lastWsScan.set(pair.name, now);
         executor.stats.slotsScanned++;
         const opps = await scanner.findOpportunitiesForPair(pair, minFlashloanLamports, flashloanLamports);
-        await tryExecute(opps, 'WS');
+        await tryExecute(opps, 'WS', now);
     };
 
     const poolWatcher = new PoolWatcher(connection);
@@ -248,10 +253,11 @@ async function startBot() {
             if (fallbackCounter % (FALLBACK_EVERY_N * 100) === 0) executor.printStats().catch(() => {});
 
             isScanning = true;
+            const fallbackStart = Date.now();
             try {
                 logger.debug(`[Fallback] Slot ${slot} — full scan ${scanner.activePairs.length} pairs`);
                 const opps = await scanner.findOpportunities(minFlashloanLamports, flashloanLamports);
-                await tryExecute(opps, 'Fallback');
+                await tryExecute(opps, 'Fallback', fallbackStart);
             } catch (e) {
                 logger.error(`[Fallback] Slot ${slot} error: ${e.message}`);
             } finally {

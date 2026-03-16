@@ -255,7 +255,7 @@ class Executor {
                 id:      1,
                 method:  'sendBundle',
                 params:  [serializedTxs],
-            }, { timeout: 10000 });
+            }, { timeout: 3000 });
             return res.data.result;
         } catch (e) {
             const detail = e.response?.data?.error?.message || e.response?.data?.message || e.message;
@@ -299,17 +299,26 @@ class Executor {
         await discord.alertExecuting(pair.name, opportunity.priceDiffPct, opportunity.loanSizeSol?.toFixed(1), profitUsd);
 
         try {
-            // ── Step 1: MarginFi borrow + repay instructions ──────────
             const borrowAmountSol = Number(amountIn) / 1e9;
-            const [borrowWrapper, repayWrapper] = await Promise.all([
-                this.mfiAccount.makeBorrowIx(borrowAmountSol, SOL_BANK_PK),
-                this.mfiAccount.makeRepayIx(borrowAmountSol, SOL_BANK_PK, true), // repayAll=true repays whatever is owed (safe on a flashloan-only account)
-            ]);
 
-            // ── Step 2: Jupiter swap instructions ─────────────────────
-            const [buyIxData, sellIxData] = await Promise.all([
-                this._getSwapInstructions(bestBuyQuote),
-                this._getSwapInstructions(reverseQuote),
+            // ── Steps 1+2+blockhash [ALL PARALLEL] ───────────────────
+            //  MFI ixs, Jupiter swap ixs, and blockhash have no mutual
+            //  dependencies — run them simultaneously to cut ~250-350ms
+            //  off the critical path vs the previous sequential layout.
+            const [
+                [borrowWrapper, repayWrapper],
+                [buyIxData, sellIxData],
+                { blockhash, lastValidBlockHeight: _lvbh },
+            ] = await Promise.all([
+                Promise.all([
+                    this.mfiAccount.makeBorrowIx(borrowAmountSol, SOL_BANK_PK),
+                    this.mfiAccount.makeRepayIx(borrowAmountSol, SOL_BANK_PK, true),
+                ]),
+                Promise.all([
+                    this._getSwapInstructions(bestBuyQuote),
+                    this._getSwapInstructions(reverseQuote),
+                ]),
+                this.connection.getLatestBlockhash('confirmed'),
             ]);
 
             // ── Step 3: Collect address lookup tables ─────────────────
@@ -375,8 +384,7 @@ class Executor {
             ];
 
             // ── Step 5: Build flashloan tx (MarginFi adds begin/end) ──
-            const { blockhash } = await this.connection.getLatestBlockhash('confirmed');
-
+            // blockhash already fetched in parallel with steps 1+2 above
             const flashTx = await this.mfiAccount.buildFlashLoanTx({
                 ixs:                        innerIxs,
                 addressLookupTableAccounts: lookupTables,
@@ -417,18 +425,24 @@ class Executor {
             }
 
             // Fallback: direct submission if Jito unavailable
+            // Re-fetch blockhash + re-sign — the Jito attempt consumed up to 3s so the
+            // original blockhash may be aged and the quote is closer to expiry.
             await discord.alertJitoFallback(pair.name);
+            const { blockhash: freshBlockhash, lastValidBlockHeight } =
+                await this.connection.getLatestBlockhash('confirmed');
+            flashTx.message.recentBlockhash = freshBlockhash;
+            flashTx.sign([this.wallet]);
+
             const sig = await this.connection.sendRawTransaction(flashTx.serialize(), {
-                skipPreflight: false,
+                skipPreflight: true,  // skip RPC simulation — saves ~80ms, tx validated on-chain
                 maxRetries:    parseInt(process.env.MAX_RETRIES || '3'),
             });
             this.stats.txSent++;
             logger.info(`[Executor] Direct tx sent: ${sig} — awaiting confirmation...`);
 
             try {
-                const { blockhash: _bh, lastValidBlockHeight } = await this.connection.getLatestBlockhash('confirmed');
                 const result = await this.connection.confirmTransaction(
-                    { signature: sig, blockhash: _bh, lastValidBlockHeight },
+                    { signature: sig, blockhash: freshBlockhash, lastValidBlockHeight },
                     'confirmed'
                 );
                 if (result.value.err) {
@@ -442,11 +456,12 @@ class Executor {
                 logger.info(`✅ FLASHLOAN TX confirmed (direct): ${sig} | Profit: ~$${profitUsd}`);
                 await telegram.alertTrade(profitUsd, pair.name, sig);
                 await discord.alertTrade(profitUsd, pair.name, sig);
+                return true;
             } catch (confirmErr) {
                 logger.error(`[Executor] Direct tx confirmation failed: ${confirmErr.message}`);
                 await discord.alertTxFailed(pair.name, confirmErr.message);
+                return false;
             }
-            return true;
 
         } catch (e) {
             logger.error(`[Executor] Execution error: ${e.message}`);

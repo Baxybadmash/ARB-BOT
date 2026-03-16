@@ -32,7 +32,7 @@ async function _post(url, content) {
         req.write(body);
         req.end();
     });
-    await Promise.race([request, new Promise(r => setTimeout(r, 5000))]);
+    await Promise.race([request, new Promise(r => setTimeout(r, 2000))]);
 }
 
 // General alerts → main webhook
@@ -40,9 +40,8 @@ async function send(content)   { await _post(webhookUrl, content); }
 // Tx-specific alerts → tx webhook (falls back to main if no separate one)
 async function sendTx(content) { await _post(txWebhookUrl, content); }
 
-function _ist() {
-    return new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' }) + ' IST';
-}
+const _istFmt = new Intl.DateTimeFormat('en-IN', { timeZone: 'Asia/Kolkata', dateStyle: 'short', timeStyle: 'medium' });
+function _ist() { return _istFmt.format(new Date()) + ' IST'; }
 
 // ── Existing alerts ──────────────────────────────────────────
 

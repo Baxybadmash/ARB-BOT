@@ -1,6 +1,9 @@
 const logger = require('./logger');
 let bot = null, chatId = null;
 
+const _istFmt = new Intl.DateTimeFormat('en-IN', { timeZone: 'Asia/Kolkata', dateStyle: 'short', timeStyle: 'medium' });
+function _ist() { return _istFmt.format(new Date()) + ' IST'; }
+
 function init() {
     if (!process.env.TELEGRAM_BOT_TOKEN || !process.env.TELEGRAM_CHAT_ID) {
         logger.info('Telegram alerts disabled');
@@ -16,13 +19,13 @@ function init() {
 
 async function send(msg) {
     if (!bot) return;
-    const timeout = new Promise((_, reject) => setTimeout(() => reject(new Error('timeout')), 5000));
+    const timeout = new Promise((_, reject) => setTimeout(() => reject(new Error('timeout')), 2000));
     try { await Promise.race([bot.sendMessage(chatId, msg, { parse_mode: 'Markdown' }), timeout]); }
     catch (e) { logger.warn('Telegram send failed: ' + e.message); }
 }
 
 async function alertTrade(profitUsd, pairName, bundleId) {
-    await send(`🟢 *ARB EXECUTED*\n💰 Profit: *$${profitUsd} USD*\n📈 Pair: ${pairName}\n🔗 Bundle: \`${bundleId}\`\n⏱ ${new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' })} IST`);
+    await send(`🟢 *ARB EXECUTED*\n💰 Profit: *$${profitUsd} USD*\n📈 Pair: ${pairName}\n🔗 Bundle: \`${bundleId}\`\n⏱ ${_ist()}`);
 }
 
 async function alertError(error) {
@@ -30,7 +33,7 @@ async function alertError(error) {
 }
 
 async function alertStartup(walletAddress) {
-    await send(`🚀 *Solana Arb Bot Started*\nWallet: \`${walletAddress}\`\n⏱ ${new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' })} IST`);
+    await send(`🚀 *Solana Arb Bot Started*\nWallet: \`${walletAddress}\`\n⏱ ${_ist()}`);
 }
 
 async function alertOffline() {

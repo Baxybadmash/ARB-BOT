@@ -28,6 +28,9 @@ const discord  = require('./discord');
 // -------------------------------------------------------
 //  CONSTANTS
 // -------------------------------------------------------
+// Instruction discriminators for patching cached instruction templates
+const BORROW_DISCRIMINATOR = Buffer.from([0x04, 0x7e, 0x74, 0x35, 0x30, 0x05, 0xd4, 0x1f]); // lendingAccountBorrow
+const REPAY_DISCRIMINATOR  = Buffer.from([0x4f, 0xd1, 0xac, 0xb1, 0xde, 0x33, 0xad, 0x97]); // lendingAccountRepay
 // swap-instructions endpoint rejects API key with 401 — use lite-api directly
 const JUPITER_SWAP_API  = 'https://lite-api.jup.ag/swap/v1';
 const JITO_BUNDLE_URL   = `${process.env.JITO_BLOCK_ENGINE_URL || 'https://mainnet.block-engine.jito.labs.io'}/api/v1/bundles`;
@@ -99,6 +102,66 @@ class Executor {
 
         logger.info(`[Executor] MarginFi account: ${this.mfiAccount.address.toString()}`);
         logger.info('[Executor] ✅ Flash loan ready (all MarginFi accounts support flashloans)');
+
+        // Pre-compute Anchor account overrides so makeBorrowIx/makeRepayIx never
+        // trigger Anchor v0.30 account resolution (which makes RPC calls per trade).
+        // authority, group, and liquidityVault are all static — safe to cache forever.
+        const solBank = this.mfiClient.banks.get(SOL_BANK_PK.toBase58());
+        this._mfiOpts = {
+            overrideInferAccounts: {
+                authority:      this.wallet.publicKey,
+                group:          this.mfiClient.config.groupPk,
+                liquidityVault: solBank?.liquidityVault,
+            },
+        };
+        logger.info(`[Executor] MFI account overrides cached (group: ${this.mfiClient.config.groupPk.toString().slice(0, 8)}...)`);
+
+        // Pre-build borrow/repay instruction templates once — avoids Anchor's
+        // _accountsResolver.resolve() (~200ms RPC call) on every trade.
+        // Per trade we only patch the 8-byte amount field in-place (pure CPU).
+        const [borrowTemplate, repayTemplate] = await Promise.all([
+            this.mfiAccount.makeBorrowIx(10, SOL_BANK_PK, this._mfiOpts),
+            this.mfiAccount.makeRepayIx(10, SOL_BANK_PK, true, this._mfiOpts),
+        ]);
+        this._borrowIxTemplate = borrowTemplate.instructions.map(ix => ({
+            programId: ix.programId, keys: ix.keys, data: Buffer.from(ix.data),
+        }));
+        this._repayIxTemplate = repayTemplate.instructions.map(ix => ({
+            programId: ix.programId, keys: ix.keys, data: Buffer.from(ix.data),
+        }));
+        logger.info('[Executor] MFI instruction templates cached ✅');
+    }
+
+    // -------------------------------------------------------
+    //  BUILD MFI BORROW/REPAY INSTRUCTIONS  (CPU only — no RPC)
+    //  Clones the startup-cached templates and patches only the
+    //  amount bytes.  Discriminator offsets verified empirically:
+    //    lendingAccountBorrow data: [discriminator(8) | amount u64 LE(8)]
+    //    lendingAccountRepay  data: [discriminator(8) | amount u64 LE(8) | repayAll(2)]
+    //    SystemProgram.transfer   data: [type u32 LE(4) | amount+10000 u64 LE(8)]
+    // -------------------------------------------------------
+    _buildMfiIxs(amountLamports) {
+        const amt = BigInt(amountLamports);
+
+        const patchAndClone = (template) => template.map(ix => {
+            const data = Buffer.from(ix.data); // always clone — never mutate cache
+
+            if (data.length === 16 && data.subarray(0, 8).equals(BORROW_DISCRIMINATOR)) {
+                data.writeBigUInt64LE(amt, 8);
+            } else if (data.length === 18 && data.subarray(0, 8).equals(REPAY_DISCRIMINATOR)) {
+                data.writeBigUInt64LE(amt, 8); // repayAll 0x0101 at [16] stays baked in
+            } else if (data.length === 12 && data.readUInt32LE(0) === 2) {
+                // SystemProgram.Transfer (wrap SOL before repay): amount + 10000 extra lamports
+                data.writeBigUInt64LE(amt + 10000n, 4);
+            }
+
+            return new TransactionInstruction({ programId: ix.programId, keys: ix.keys, data });
+        });
+
+        return [
+            { instructions: patchAndClone(this._borrowIxTemplate) },
+            { instructions: patchAndClone(this._repayIxTemplate) },
+        ];
     }
 
     // -------------------------------------------------------
@@ -300,21 +363,16 @@ class Executor {
         discord.alertExecuting(pair.name, opportunity.priceDiffPct, opportunity.loanSizeSol?.toFixed(1), profitUsd).catch(() => {});
 
         try {
-            const borrowAmountSol = Number(amountIn) / 1e9;
+            // ── Step 1: MFI ixs (CPU — cached templates, no RPC) ─────────
+            const amountLamports = Math.round(Number(amountIn));
+            const [borrowWrapper, repayWrapper] = this._buildMfiIxs(amountLamports);
 
-            // ── Steps 1+2+blockhash [ALL PARALLEL] ───────────────────
-            //  MFI ixs, Jupiter swap ixs, and blockhash have no mutual
-            //  dependencies — run them simultaneously to cut ~250-350ms
-            //  off the critical path vs the previous sequential layout.
+            // ── Steps 2+blockhash [PARALLEL] ────────────────────────────
+            //  Jupiter swap ixs and blockhash have no mutual dependencies.
             const [
-                [borrowWrapper, repayWrapper],
                 [buyIxData, sellIxData],
                 { blockhash, lastValidBlockHeight: _lvbh },
             ] = await Promise.all([
-                Promise.all([
-                    this.mfiAccount.makeBorrowIx(borrowAmountSol, SOL_BANK_PK),
-                    this.mfiAccount.makeRepayIx(borrowAmountSol, SOL_BANK_PK, true),
-                ]),
                 Promise.all([
                     this._getSwapInstructions(bestBuyQuote),
                     this._getSwapInstructions(reverseQuote),
@@ -392,26 +450,26 @@ class Executor {
                 blockhash,
             });
 
-            // Guard: Solana versioned transactions are capped at 1232 bytes.
-            // Serialise before signing to check size; throw a clear error if oversized.
-            // Note: serialize() itself throws "encoding overruns Uint8Array" when the tx
-            // is so large the buffer can't be allocated — catch that too.
-            let sizeCheck;
-            try {
-                sizeCheck = flashTx.serialize().length;
-            } catch (e) {
-                throw new Error(`Transaction too large to serialize (reduce JUPITER_MAX_ACCOUNTS). ${e.message}`);
-            }
-            if (sizeCheck > 1232) {
-                throw new Error(`Transaction too large: ${sizeCheck} bytes (limit 1232). Reduce JUPITER_MAX_ACCOUNTS.`);
-            }
-            logger.debug(`[Executor] Tx size: ${sizeCheck} bytes`);
-
             // ── Step 6: Sign ──────────────────────────────────────────
             flashTx.sign([this.wallet]);
 
+            // Guard: Solana versioned transactions are capped at 1232 bytes.
+            // Serialize once after signing — used for both size check and Jito submission.
+            // Note: serialize() throws "encoding overruns Uint8Array" when the tx is too
+            // large for the buffer — catch that too.
+            let serializedBuf;
+            try {
+                serializedBuf = Buffer.from(flashTx.serialize());
+            } catch (e) {
+                throw new Error(`Transaction too large to serialize (reduce JUPITER_MAX_ACCOUNTS). ${e.message}`);
+            }
+            if (serializedBuf.length > 1232) {
+                throw new Error(`Transaction too large: ${serializedBuf.length} bytes (limit 1232). Reduce JUPITER_MAX_ACCOUNTS.`);
+            }
+            logger.debug(`[Executor] Tx size: ${serializedBuf.length} bytes`);
+
             // ── Step 7: Submit via Jito ───────────────────────────────
-            const serialized = Buffer.from(flashTx.serialize()).toString('base64');
+            const serialized = serializedBuf.toString('base64');
             const bundleId   = await this._submitJitoBundle([serialized]);
 
             if (bundleId) {

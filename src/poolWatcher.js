@@ -11,7 +11,7 @@ const { PublicKey } = require('@solana/web3.js');
 const axios  = require('axios');
 const logger = require('./logger');
 
-const DEBOUNCE_MS = 150; // deduplicate rapid multi-pool fires for same pair; real rate limit is 500ms in bot.js
+const DEBOUNCE_MS = 50; // deduplicate rapid multi-pool fires for same pair; real rate limit is 500ms in bot.js
 
 // -------------------------------------------------------
 //  ORCA PDA DERIVATION  (no API call needed)

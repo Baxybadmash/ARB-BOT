@@ -375,8 +375,7 @@ async function updatePairs(flashloanLamports, _unused = null, discordAlert = nul
             .join('\n');
         const nextDate  = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toLocaleDateString('en-IN');
 
-        if (discordAlert) {
-            await discordAlert(
+        await discordAlert(
 `🔄 **Monthly Pair Update Complete**
 📊 Active pairs: ${newPairs.length}
 
@@ -387,8 +386,7 @@ ${pairList}
 ${topScores}
 
 Next update: ${nextDate}`
-            );
-        }
+        );
     }
 
     return newPairs;

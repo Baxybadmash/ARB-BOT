@@ -8,8 +8,10 @@
 require('dotenv').config();
 
 const { Connection, Keypair, LAMPORTS_PER_SOL } = require('@solana/web3.js');
+const https = require('https');
+const http  = require('http');
 const bs58       = require('bs58');
-const { PriceScanner }                    = require('./scanner');
+const { PriceScanner, computeTargetLam }  = require('./scanner');
 const { Executor }                        = require('./executor');
 const { updatePairs, isUpdateDue, getUpdateStatus } = require('./pairUpdater');
 const { findOptimalLoanSize }                       = require('./loanSizer');
@@ -35,10 +37,17 @@ function validateConfig() {
 //  CONNECT RPC
 // -------------------------------------------------------
 async function createConnection() {
+    // keepAlive agents prevent TCP+TLS re-handshake between RPC calls,
+    // eliminating the ~400ms cold spike after idle periods.
+    const keepAliveAgent = {
+        httpsAgent: new https.Agent({ keepAlive: true, maxSockets: 10 }),
+        httpAgent:  new http.Agent({ keepAlive: true, maxSockets: 10 }),
+    };
     const primary = new Connection(process.env.RPC_URL_PRIMARY, {
         commitment: 'confirmed',
         wsEndpoint: process.env.RPC_URL_WEBSOCKET,
-        confirmTransactionInitialTimeout: 60000
+        confirmTransactionInitialTimeout: 60000,
+        fetchMiddleware: (url, options, fetch) => fetch(url, { ...options, agent: url.startsWith('https') ? keepAliveAgent.httpsAgent : keepAliveAgent.httpAgent }),
     });
 
     try {
@@ -175,9 +184,8 @@ async function startBot() {
     let lastSlotTime = Date.now();
     let isExecuting  = false;
     let isScanning   = false;   // prevents overlapping fallback full-scans (scan takes ~3.7s)
-    let isWsScanning = false;   // serializes WS scans — prevents queue stacking when multiple pairs fire simultaneously
     const lastWsScan = new Map(); // pair.name → timestamp, prevents WS burst
-    const WS_DEBOUNCE_MS = parseInt(process.env.WS_DEBOUNCE_MS || '2000');  // min gap between WS scans of same pair
+    const WS_DEBOUNCE_MS = parseInt(process.env.WS_DEBOUNCE_MS || '200');  // min gap between WS scans of same pair
 
     // Shared execute helper — used by both WS trigger and slot fallback
     async function tryExecute(opportunities, label, triggerTime) {
@@ -186,16 +194,25 @@ async function startBot() {
 
         isExecuting = true;
         try {
-            const top = opportunities[0];
-            let finalOpp = top;
-            if (process.env.OPTIMAL_SIZING === 'true') {
-                const refined = await findOptimalLoanSize(scanner, top.pair, minFlashloanLamports, flashloanLamports);
-                if (refined && refined.grossProfit > top.grossProfit) {
-                    finalOpp = { ...top, ...refined, loanSizeSol: refined.size / 1e9, amountIn: BigInt(refined.size) };
+            let finalOpp = opportunities[0];
+            executor.stats.oppsDetected++;
+            logger.info(`[${label}] Detected: ${opportunities[0].pair.name} | spread: ${opportunities[0].priceDiffPct}% | loan: ${opportunities[0].loanSizeSol?.toFixed(1)} SOL`);
+
+            // Re-quote at target loan size only when expected gross exceeds MIN_PROFIT_USD.
+            // Skips the 2 extra API calls (~200ms) for sub-threshold spreads that the
+            // executor will reject anyway, keeping detection latency at ~220ms.
+            const targetLam = computeTargetLam(finalOpp.spreadPct, minFlashloanLamports, flashloanLamports);
+            if (targetLam > Number(finalOpp.amountIn) * 1.5 && finalOpp.spreadPct > 0.0001) {
+                const resized = await scanner.reSizeScan(finalOpp.pair, targetLam);
+                if (resized) {
+                    finalOpp = resized;
+                } else {
+                    logger.info(`[${label}] Skip(null): ${finalOpp.pair.name} spread=${(finalOpp.spreadPct*100).toFixed(4)}% target=${(targetLam/1e9).toFixed(1)}SOL`);
+                    return;
                 }
             }
             const scanMs = triggerTime ? Date.now() - triggerTime : null;
-            logger.info(`[${label}] Opportunity: ${top.pair.name} | spread: ${top.priceDiffPct}% | loan: ${top.loanSizeSol?.toFixed(1)} SOL${scanMs !== null ? ` | scan: ${scanMs}ms` : ''}`);
+            logger.info(`[${label}] Opportunity: ${finalOpp.pair.name} | spread: ${finalOpp.priceDiffPct}% | loan: ${finalOpp.loanSizeSol?.toFixed(1)} SOL${scanMs !== null ? ` | scan: ${scanMs}ms` : ''}`);
             const execStart = Date.now();
             await executor.execute(finalOpp);
             const execMs = Date.now() - execStart;
@@ -213,17 +230,15 @@ async function startBot() {
     //  Fires immediately when a pool swap changes reserves.
     // -------------------------------------------------------
     const wsCallback = async (pair) => {
-        if (isExecuting || isWsScanning) return;
         const now = Date.now();
         if (now - (lastWsScan.get(pair.name) || 0) < WS_DEBOUNCE_MS) return;
         lastWsScan.set(pair.name, now);
-        isWsScanning = true;
         executor.stats.slotsScanned++;
         try {
             const opps = await scanner.findOpportunitiesForPair(pair, minFlashloanLamports, flashloanLamports);
             await tryExecute(opps, 'WS', now);
-        } finally {
-            isWsScanning = false;
+        } catch (e) {
+            logger.debug(`[WS] Error: ${e.message}`);
         }
     };
 
@@ -288,6 +303,16 @@ async function startBot() {
     // Start monthly pair update scheduler (now also resubscribes poolWatcher)
     startUpdateScheduler(scanner, flashloanLamports, poolWatcher, wsCallback);
 
+    // Liveness heartbeat every 2 minutes — confirms bot is scanning even when market is flat
+    let _lastHeartbeatSlots = 0;
+    setInterval(() => {
+        const slotDelta = executor.stats.slotsScanned - _lastHeartbeatSlots;
+        _lastHeartbeatSlots = executor.stats.slotsScanned;
+        logger.info(
+            `💓 alive | slots +${slotDelta} | detected: ${executor.stats.oppsDetected} | attempted: ${executor.stats.oppsAttempted} | sent: ${executor.stats.txSent}`
+        );
+    }, 2 * 60 * 1000);
+
     // Stats + Discord heartbeat every 30 mins
     setInterval(async () => {
         executor.printStats().catch(() => {});
@@ -306,7 +331,7 @@ async function startBot() {
     async function shutdown(signal) {
         logger.info(`\n${signal} received — shutting down...`);
         executor.printStats().catch(() => {});
-        poolWatcher.unsubscribeAll();
+        await poolWatcher.unsubscribeAll();
         if (subscriptionId !== null) {
             try { connection.removeSlotChangeListener(subscriptionId); } catch (_) {}
         }

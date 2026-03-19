@@ -28,25 +28,44 @@ const JUPITER_QUOTE_API = process.env.JUPITER_API_KEY
 
 // Global 429 backoff state
 let _rateLimitedUntil = 0;
-const RATE_LIMIT_PAUSE_MS = 60 * 1000;
+const RATE_LIMIT_PAUSE_MS = 15 * 1000;
 
-// Shared rate limiter — both WS and fallback paths draw from the same token bucket.
-// Prevents combined rate from exceeding Jupiter paid tier (600 req/min = 10/sec).
-// Default: 8/sec = 480/min (20% headroom). Override with JUPITER_RATE_LIMIT_PER_SEC.
-const RATE_LIMIT_PER_SEC = parseInt(process.env.JUPITER_RATE_LIMIT_PER_SEC || '8');
-const MIN_GAP_MS         = Math.ceil(1000 / RATE_LIMIT_PER_SEC); // 125ms at 8/sec
+// Single priority queue — WS (fast) calls jump to front, fallback (slow) calls go to back.
+// Single queue eliminates the _lastCallTime race condition that caused burst 429s when
+// both queues fired within the same API call window.
+// Default: 6/sec = 360/min (40% headroom under 600/min paid tier).
+const RATE_LIMIT_PER_SEC = parseInt(process.env.JUPITER_RATE_LIMIT_PER_SEC || '6');
+const MIN_GAP_MS         = Math.ceil(1000 / RATE_LIMIT_PER_SEC); // 167ms at 6/sec
 
-let _lastCallTime     = 0;
-let _rateLimiterQueue = Promise.resolve();
+let _lastCallTime = 0;
+let _callQueue    = []; // { fn, resolve, reject }
+let _processing   = false;
 
+async function _processQueue() {
+    if (_processing || _callQueue.length === 0) return;
+    _processing = true;
+    const { fn, resolve, reject } = _callQueue.shift();
+    const wait = Math.max(0, _lastCallTime + MIN_GAP_MS - Date.now());
+    if (wait > 0) await new Promise(r => setTimeout(r, wait));
+    _lastCallTime = Date.now();
+    try { resolve(await fn()); } catch (e) { reject(e); }
+    _processing = false;
+    _processQueue();
+}
+
+// Slow path — fallback slot-polling (appends to back of queue)
 function _enqueueCall(fn) {
     return new Promise((resolve, reject) => {
-        _rateLimiterQueue = _rateLimiterQueue.then(async () => {
-            const wait = Math.max(0, _lastCallTime + MIN_GAP_MS - Date.now());
-            if (wait > 0) await new Promise(r => setTimeout(r, wait));
-            _lastCallTime = Date.now();
-            try { resolve(await fn()); } catch (e) { reject(e); }
-        });
+        _callQueue.push({ fn, resolve, reject });
+        _processQueue();
+    });
+}
+
+// Fast path — WS-triggered scans (jumps to front of queue, ahead of any pending fallback calls)
+function _enqueueCallFast(fn) {
+    return new Promise((resolve, reject) => {
+        _callQueue.unshift({ fn, resolve, reject });
+        _processQueue();
     });
 }
 
@@ -118,7 +137,26 @@ function _jupiterQuote(inputMint, outputMint, amount, extraParams = {}) {
 }
 
 function _jupiterQuoteFast(inputMint, outputMint, amount, extraParams = {}) {
-    return _enqueueCall(() => _doQuote(inputMint, outputMint, amount, extraParams));
+    return _enqueueCallFast(() => _doQuote(inputMint, outputMint, amount, extraParams));
+}
+
+// -------------------------------------------------------
+//  TARGET LOAN SIZE
+//  Formula: target = 2× minProfit / (spread × solPrice), capped at 30 SOL.
+//  Ensures the target is the minimum loan where expected gross ≈ 2× minProfit,
+//  giving a 50% buffer for market impact / slippage.
+//  Example: 0.018% spread → 37 SOL (close to confirmed 35 SOL working trade)
+//           0.031% spread → 22 SOL (vs old 60 SOL that always failed)
+// -------------------------------------------------------
+function _computeTargetLam(spreadPct, minLam, maxLam) {
+    const s = Math.abs(spreadPct);
+    if (s <= 0) return minLam;
+    const solPrice     = parseFloat(process.env.SOL_PRICE_USD  || '90');
+    const minProfitUsd = parseFloat(process.env.MIN_PROFIT_USD || '0.30');
+    const MAX_SOL_CAP  = 5; // never exceed 30 SOL — limits market impact on thin pairs
+    const targetSol    = Math.min((minProfitUsd * 1.2) / (s * solPrice), MAX_SOL_CAP);
+    const targetLam    = Math.floor(targetSol * 1e9);
+    return Math.max(Math.min(targetLam, maxLam), minLam);
 }
 
 // -------------------------------------------------------
@@ -204,32 +242,31 @@ class PriceScanner {
             `profit=${probeProfit} (${(spreadPct * 100).toFixed(4)}%)`
         );
 
-        // Scale loan size linearly with spread
-        const ratio          = Math.min(Math.abs(spreadPct) / 0.01, 1.0); // 0→0, 1%+→1
-        const optimalAmount  = Math.round(minAmountIn + ratio * (maxAmountIn - minAmountIn));
-        const optimalAmount_ = Math.min(Math.max(optimalAmount, minAmountIn), maxAmountIn);
+        // Compute aggressive target loan size from spread table
+        const targetLam = _computeTargetLam(spreadPct, minAmountIn, maxAmountIn);
 
         let bestBuyQuote  = buyProbe;
         let bestSellQuote = sellProbe;
         let grossProfit   = probeProfit;
         let amountIn      = BigInt(minAmountIn);
 
-        // Re-quote at optimal size only if meaningfully larger than probe.
-        // Skipped on WS path — probe size is good enough and saves 2 API calls.
-        if (!skipReQuote && optimalAmount_ > minAmountIn * 1.5) {
-            const buyFull = await quoteFn(pair.tokenA, pair.tokenB, optimalAmount_);
+        // Re-quote at target size for correct quotes at amountIn.
+        // If re-quote fails or shows negative profit, keep probe values —
+        // executor will reject via MIN_PROFIT_USD check and log "below min profit".
+        if (!skipReQuote && targetLam > minAmountIn * 1.5) {
+            const buyFull = await quoteFn(pair.tokenA, pair.tokenB, targetLam);
             if (buyFull?.outAmount) {
                 const fullTokenOut = BigInt(buyFull.outAmount);
                 const sellFull = await quoteFn(pair.tokenB, pair.tokenA, fullTokenOut.toString());
                 if (sellFull?.outAmount) {
-                    const fullSolBack = BigInt(sellFull.outAmount);
-                    const fullProfit  = fullSolBack - BigInt(optimalAmount_);
+                    const fullProfit = BigInt(sellFull.outAmount) - BigInt(targetLam);
                     if (fullProfit > 0n) {
                         bestBuyQuote  = buyFull;
                         bestSellQuote = sellFull;
                         grossProfit   = fullProfit;
-                        amountIn      = BigInt(optimalAmount_);
+                        amountIn      = BigInt(targetLam);
                     }
+                    // negative profit at target → keep probe values (executor rejects gracefully)
                 }
             }
         }
@@ -261,10 +298,12 @@ class PriceScanner {
 
         const opportunities = [];
 
-        // Scan pairs sequentially to avoid burst API calls
+        // Scan pairs sequentially to avoid burst API calls.
+        // skipReQuote=true: saves 2 API calls per pair when a spread is found.
+        // OPTIMAL_SIZING in bot.js handles loan sizing for genuinely profitable opps.
         for (const pair of this.activePairs) {
             try {
-                const result = await this.scanPair(pair, minLamports, maxLamports);
+                const result = await this.scanPair(pair, minLamports, maxLamports, _jupiterQuote, true);
                 // Populate cache — WS triggers for this pair will reuse this result
                 // if it fires within WS_NO_OPP_TTL_MS / WS_OPP_TTL_MS
                 this._scanCache.set(pair.name, { result: result || null, timestamp: Date.now() });
@@ -286,26 +325,25 @@ class PriceScanner {
     }
 
     // -------------------------------------------------------
+    //  WS PROBE SCAN — always 2 calls (~200ms), fast detection.
+    //  Re-quote at target loan size happens in bot.js tryExecute
+    //  right before execution (reSizeScan), keeping this path fast.
+    // -------------------------------------------------------
     async findOpportunitiesForPair(pair, minLamports, maxLamports) {
         const now    = Date.now();
         const cached = this._scanCache.get(pair.name);
-
         if (cached) {
             const age = now - cached.timestamp;
-            // Recent scan found no opportunity — skip Jupiter call entirely
             if (!cached.result && age < parseInt(process.env.WS_NO_OPP_TTL_MS || '500')) {
                 logger.debug(`[Scanner] Cache skip ${pair.name} — no opp ${age}ms ago`);
                 return [];
             }
-            // Recent scan found a profitable opportunity — use it directly
             if (cached.result && age < parseInt(process.env.WS_OPP_TTL_MS || '300')) {
                 logger.debug(`[Scanner] Cache hit ${pair.name} — opp ${age}ms ago`);
                 return [cached.result];
             }
         }
-
         try {
-            // WS-priority queue + skip re-quote (probe size is sufficient for WS triggers)
             const result = await this.scanPair(pair, minLamports, maxLamports, _jupiterQuoteFast, true);
             this._scanCache.set(pair.name, { result: result || null, timestamp: Date.now() });
             if (result && result.grossProfit > 0n) return [result];
@@ -314,6 +352,34 @@ class PriceScanner {
         }
         return [];
     }
+
+    // -------------------------------------------------------
+    //  RE-SIZE SCAN — 2 calls at target loan size, called from
+    //  tryExecute right before execution to get exact quotes.
+    // -------------------------------------------------------
+    async reSizeScan(pair, targetLam) {
+        const buyFull = await _jupiterQuoteFast(pair.tokenA, pair.tokenB, targetLam);
+        if (!buyFull?.outAmount) return null;
+        const tokenOut = BigInt(buyFull.outAmount);
+        const sellFull = await _jupiterQuoteFast(pair.tokenB, pair.tokenA, tokenOut.toString());
+        if (!sellFull?.outAmount) return null;
+        const profit = BigInt(sellFull.outAmount) - BigInt(targetLam);
+        if (profit <= 0n) return null;
+        const spreadPct = Number(profit) / targetLam;
+        return {
+            pair,
+            amountIn:        BigInt(targetLam),
+            loanSizeSol:     targetLam / 1e9,
+            grossProfit:     profit,
+            spreadPct,
+            priceDiffPct:    (Math.abs(spreadPct) * 100).toFixed(3),
+            bestDex:         'Jupiter',
+            bestBuyQuote:    buyFull,
+            reverseQuote:    sellFull,
+            amountAfterBuy:  tokenOut,
+            amountAfterSell: BigInt(sellFull.outAmount),
+        };
+    }
 }
 
-module.exports = { PriceScanner, DEFAULT_PAIRS };
+module.exports = { PriceScanner, DEFAULT_PAIRS, computeTargetLam: _computeTargetLam };

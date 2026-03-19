@@ -202,14 +202,16 @@ class PoolWatcher {
 
     // Refresh subscriptions when pair list changes (monthly update)
     async resubscribe(pairs, callback) {
-        this.unsubscribeAll();
+        await this.unsubscribeAll();
         await this.subscribe(pairs, callback);
     }
 
-    unsubscribeAll() {
-        for (const { subId } of this.subscriptions) {
-            this.connection.removeAccountChangeListener(subId).catch(() => {});
-        }
+    async unsubscribeAll() {
+        await Promise.all(
+            this.subscriptions.map(({ subId }) =>
+                this.connection.removeAccountChangeListener(subId).catch(() => {})
+            )
+        );
         this.subscriptions = [];
         logger.info('[PoolWatcher] All subscriptions removed');
     }

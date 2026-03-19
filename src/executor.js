@@ -55,7 +55,7 @@ const FLASHLOAN_FEE_BPS = 0n;
 
 const DATA_DIR          = path.join(__dirname, '..', 'data');
 const MFI_ACCOUNT_FILE  = path.join(DATA_DIR, 'marginfi_account.json');
-const LUT_CACHE_TTL_MS  = 5 * 60 * 1000; // LUTs are stable; 5-min TTL saves ~75ms per execution
+const LUT_CACHE_TTL_MS  = 30 * 60 * 1000; // LUTs are immutable on-chain — 30-min TTL is safe
 
 // -------------------------------------------------------
 class Executor {
@@ -74,8 +74,7 @@ class Executor {
             totalProfit:   0n,
         };
         this._lutCache     = new Map(); // key: sorted LUT addrs, value: { tables, cachedAt }
-        this._blockhashCache = null;    // { blockhash, lastValidBlockHeight } — refreshed every 500ms
-        this._swapIxCache  = new Map(); // key: quote fingerprint, value: swap instructions response
+        this._blockhashCache = null;    // { blockhash, lastValidBlockHeight } — refreshed every 200ms
     }
 
     // -------------------------------------------------------
@@ -150,8 +149,8 @@ class Executor {
             }
         };
         refresh(); // warm up immediately
-        setInterval(refresh, 500);
-        logger.info('[Executor] Blockhash cache started (refresh every 500ms) ✅');
+        setInterval(refresh, 200);
+        logger.info('[Executor] Blockhash cache started (refresh every 200ms) ✅');
     }
 
     // -------------------------------------------------------
@@ -238,13 +237,6 @@ class Executor {
         const minProfitLamports = BigInt(Math.ceil((minProfitUsd / solPrice) * 1e9));
         const totalCosts        = jitoTip + txFee + flashloanFee;
 
-        // Guard: spread must exceed slippage tolerance on both legs, otherwise Jupiter
-        // will revert with SlippageToleranceExceeded (0x1788) if price ticks even slightly.
-        // Require spread > 2× slippage so the net profit survives worst-case slippage.
-        const slippageBps      = parseInt(process.env.SLIPPAGE_BPS || this.config.SLIPPAGE_BPS || '50');
-        const minSpreadLamports = BigInt(Math.ceil(Number(amountIn) * (slippageBps * 2) / 10000));
-        if (grossProfit <= minSpreadLamports) return false;
-
         return grossProfit > minProfitLamports + totalCosts;
     }
 
@@ -254,25 +246,19 @@ class Executor {
     //  prioritizationFeeLamports omitted — Jito tip handles ordering,
     //  and including it adds a SetComputeUnitPrice ix that wastes tx bytes.
     // -------------------------------------------------------
-    async _getSwapInstructions(quoteResponse) {
-        // Cache keyed by quote fingerprint — same route/amounts → same instructions
-        const key = `${quoteResponse.inputMint}:${quoteResponse.outputMint}:${quoteResponse.inAmount}:${quoteResponse.outAmount}`;
-        if (this._swapIxCache.has(key)) return this._swapIxCache.get(key);
+    async _getSwapInstructions(quoteResponse, slippageOverride = null) {
+        const slippageBps = slippageOverride !== null
+            ? slippageOverride
+            : parseInt(process.env.SLIPPAGE_BPS || this.config.SLIPPAGE_BPS || '50');
 
-        const slippageBps = parseInt(process.env.SLIPPAGE_BPS || this.config.SLIPPAGE_BPS || '50');
         const params = {
             quoteResponse,
             userPublicKey:           this.wallet.publicKey.toString(),
-            wrapAndUnwrapSol:        false,   // wSOL is managed by MarginFi borrow/repay
+            wrapAndUnwrapSol:        false,
             dynamicComputeUnitLimit: true,
             slippageBps,
         };
         const res = await axios.post(`${JUPITER_SWAP_API}/swap-instructions`, params, { timeout: 6000 });
-
-        this._swapIxCache.set(key, res.data);
-        if (this._swapIxCache.size > 20) {
-            this._swapIxCache.delete(this._swapIxCache.keys().next().value); // evict oldest
-        }
         return res.data;
     }
 
@@ -421,7 +407,7 @@ class Executor {
 
             const [buyIxData, sellIxData] = await Promise.all([
                 this._getSwapInstructions(bestBuyQuote),
-                this._getSwapInstructions(reverseQuote),
+                this._getSwapInstructions(reverseQuote, 0),
             ]);
 
             // ── Step 3: Collect address lookup tables ─────────────────
@@ -488,10 +474,15 @@ class Executor {
 
             // ── Step 5: Build flashloan tx (MarginFi adds begin/end) ──
             // blockhash already fetched in parallel with steps 1+2 above
+            // Fetch fresh blockhash right before building tx — swap-ix calls take ~400ms
+            // and the cached blockhash may be stale by the time we reach here.
+            const freshBh = await this.connection.getLatestBlockhash('processed');
+            const finalBlockhash = freshBh.blockhash;
+            const finalLastValidBlockHeight = freshBh.lastValidBlockHeight;
             const flashTx = await this.mfiAccount.buildFlashLoanTx({
                 ixs:                        innerIxs,
                 addressLookupTableAccounts: lookupTables,
-                blockhash,
+                blockhash:           finalBlockhash,
             });
 
             // ── Step 6: Sign ──────────────────────────────────────────
@@ -525,38 +516,48 @@ class Executor {
             const [bundleId, directSig] = await Promise.all([jitoP, directP]);
             this.stats.txSent++;
 
-            if (bundleId) {
-                this.stats.txSuccess++;
-                this.stats.totalProfit += grossProfit;
-                logger.info(`✅ FLASHLOAN SENT | Profit: ~$${profitUsd} | Bundle: ${bundleId}${directSig ? ` | Direct: ${directSig}` : ''}`);
-                discord.alertTrade(profitUsd, pair.name, bundleId).catch(() => {});
-                return true;
-            }
-
+            // Always confirm on-chain via directSig — a Jito bundleId only means the bundle
+            // was accepted by the block engine, NOT that it landed on-chain. The same signed
+            // tx is sent via both paths so directSig confirms whichever path landed it.
             if (directSig) {
-                discord.alertJitoFallback(pair.name).catch(() => {});
-                logger.info(`[Executor] Jito rejected — direct tx: ${directSig} — awaiting confirmation...`);
+                if (!bundleId) {
+                    discord.alertJitoFallback(pair.name).catch(() => {});
+                }
+                logger.info(`[Executor] Confirming tx on-chain: ${directSig}${bundleId ? ` (Jito bundle: ${bundleId})` : ''}`);
                 try {
-                    const result = await this.connection.confirmTransaction(
-                        { signature: directSig, blockhash, lastValidBlockHeight },
-                        'confirmed'
+                    const confirmTimeout = new Promise((_, reject) =>
+                        setTimeout(() => reject(new Error('Confirmation timeout after 30s')), 30000)
                     );
+                    const result = await Promise.race([
+                        this.connection.confirmTransaction(
+                            { signature: directSig, blockhash: finalBlockhash, lastValidBlockHeight: finalLastValidBlockHeight },
+                            'confirmed'
+                        ),
+                        confirmTimeout,
+                    ]);
                     if (result.value.err) {
                         const reason = JSON.stringify(result.value.err);
-                        logger.error(`[Executor] Direct tx failed on-chain: ${reason}`);
+                        logger.error(`[Executor] Tx failed on-chain: ${reason}`);
                         discord.alertTxFailed(pair.name, reason).catch(() => {});
                         return false;
                     }
                     this.stats.txSuccess++;
                     this.stats.totalProfit += grossProfit;
-                    logger.info(`✅ FLASHLOAN confirmed (direct): ${directSig} | Profit: ~$${profitUsd}`);
+                    logger.info(`✅ FLASHLOAN confirmed | Profit: ~$${profitUsd} | Sig: ${directSig}${bundleId ? ` | Bundle: ${bundleId}` : ''}`);
                     discord.alertTrade(profitUsd, pair.name, directSig).catch(() => {});
                     return true;
                 } catch (confirmErr) {
-                    logger.error(`[Executor] Direct tx confirmation failed: ${confirmErr.message}`);
+                    logger.error(`[Executor] Tx confirmation failed: ${confirmErr.message}`);
                     discord.alertTxFailed(pair.name, confirmErr.message).catch(() => {});
                     return false;
                 }
+            }
+
+            // directSig unavailable (direct RPC rejected) but Jito may have accepted —
+            // cannot confirm on-chain without a signature, so do not count as success.
+            if (bundleId) {
+                logger.warn(`[Executor] Jito bundle accepted (${bundleId}) but direct RPC rejected — cannot confirm on-chain`);
+                return false;
             }
 
             logger.warn(`[Executor] Both Jito and direct submission failed`);

@@ -79,7 +79,7 @@ async function alertExecuting(pairName, spreadPct, loanSol, estimatedProfitUsd) 
 }
 
 async function alertBelowMinProfit(pairName, grossSol, grossUsd, minProfitUsd) {
-    if (!process.env.DISCORD_VERBOSE) return;  // opt-in — can be noisy
+    if (process.env.DISCORD_VERBOSE !== 'true') return;  // opt-in — can be noisy
     await sendTx(
         `⚪ **BELOW MIN PROFIT** — ${pairName}\n` +
         `💸 Gross: ${grossSol} SOL (~$${grossUsd}) | Min: $${minProfitUsd}\n` +

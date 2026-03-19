@@ -91,8 +91,8 @@ function calcSafetyCap(pool, pair, configMaxLamports) {
 // -------------------------------------------------------
 //  SINGLE PROBE  — delegates to scanner.scanPair
 // -------------------------------------------------------
-async function probe(scanner, pair, amountLamports) {
-    const result = await scanner.scanPair(pair, amountLamports, amountLamports);
+async function probe(scanner, pair, amountLamports, maxLamports) {
+    const result = await scanner.scanPair(pair, amountLamports, maxLamports || amountLamports);
     if (!result || result.grossProfit <= 0n) return null;
     return {
         size:           amountLamports,
@@ -142,7 +142,7 @@ async function findOptimalLoanSize(scanner, pair, minLamports, configMaxLamports
             Math.round(clampedMin + (i / (COARSE - 1)) * (safeMax - clampedMin))
         );
         const coarseResults = await Promise.all(
-            coarseSizes.map(s => probe(scanner, pair, s).catch(() => null))
+            coarseSizes.map(s => probe(scanner, pair, s, safeMax).catch(() => null))
         );
         let peakIdx = 0;
         for (let i = 1; i < coarseResults.length; i++) {
@@ -160,7 +160,7 @@ async function findOptimalLoanSize(scanner, pair, minLamports, configMaxLamports
     const mid = Math.round((lo + hi) / 2);
 
     const fineResults = await Promise.all(
-        [lo, mid, hi].map(s => probe(scanner, pair, s).catch(() => null))
+        [lo, mid, hi].map(s => probe(scanner, pair, s, safeMax).catch(() => null))
     );
 
     let best = null;

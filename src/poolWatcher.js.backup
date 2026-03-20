@@ -69,14 +69,14 @@ function fetchOrcaPools(pairs) {
 
 // Raydium AMM v4 pool addresses for our default pairs — hardcoded because the
 // full pairs endpoint returns 700k entries (~100MB). These on-chain addresses are
-// permanent. Verified 2026-03-20 via GeckoTerminal + Solscan.
+// permanent. Looked up 2026-03-15 from api.raydium.io/v2/main/pairs by highest liquidity.
 // If the monthly updater adds new pairs, CLMM + Orca + Meteora still cover them.
 const RAYDIUM_AMM_POOLS = new Map([
-    ['So11111111111111111111111111111111111111112:Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB', '7XawhbbxtsRcQA8KTkHT9f9nc6d69UwqCDh6U5EEbEmX'], // SOL/USDT  — $8.8M liq
-    ['So11111111111111111111111111111111111111112:EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v', '58oQChx4yWmvKdwLLZzBi4ChoCc2fqCUWBkwMihLYQo2'], // SOL/USDC  — $8.8M liq
+    ['So11111111111111111111111111111111111111112:Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB', '7XawhbbxtsRcQA8KTkHT9f9nc6d69UwqCDh6U5EEbEmX'], // SOL/USDT
     ['So11111111111111111111111111111111111111112:DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263', 'HVNwzt7Pxfu76KHCMQPTLuTCLTm6WnQ1esLv4eizseSv'], // SOL/BONK
-    ['So11111111111111111111111111111111111111112:EKpQGSJtjMFqKZ9KQanSqYXRcF8fBopzLHYxdM65zcjm', 'EP2ib6dYdEeqD8MfE2ezHCxX3kP3K2eLKkirfPm5eyMx'], // SOL/WIF   — $8.9M liq
-    ['So11111111111111111111111111111111111111112:9BB6NFEcjBCtnNLFko2FqVQBq8HHM13kCyYcdQbgpump', 'Bzc9NZfMqkXR6fz1DBph7BDf9BroyEf6pnzESP7v5iiw'], // SOL/FARTCOIN — $7.6M liq
+    ['So11111111111111111111111111111111111111112:EKpQGSJtjMFqKZ9KQanSqYXRcF8fBopzLHYxdM65zcjm', 'EP2ib6dYdEeqD8MfE2ezHCxX3kP3K2eLKkirfPm5eyMx'], // SOL/WIF
+    ['So11111111111111111111111111111111111111112:7GCihgDB8fe6KNjn2MYtkzZcRjQy3t9GHdC8uHYmW2hr',  'FRhB8L7Y9Qq41qZXYLtC2nw8An1RJfLLxRF2x9RwLLMo'], // SOL/POPCAT
+    ['So11111111111111111111111111111111111111112:JUPyiwrYJFskUPiHa7hkeR8VUtAeFoSYbKedZNsDvCN',  'EYErUp5muPYEEkeaUCY22JibeZX7E9UuMcJFZkmNAN7c'], // SOL/JUP
 ]);
 
 async function fetchRaydiumPools(pairs) {
@@ -95,8 +95,6 @@ async function fetchRaydiumPools(pairs) {
                 .sort((a, b) => parseFloat(b.tvl || 0) - parseFloat(a.tvl || 0));
             if (matches.length > 0) {
                 found.push({ address: matches[0].id, dex: 'Raydium CLMM', pair });
-            } else {
-                logger.info(`[PoolWatcher] Raydium CLMM: no pool found for ${pair.name}`);
             }
         }
     } catch (e) {
@@ -109,8 +107,6 @@ async function fetchRaydiumPools(pairs) {
                      || RAYDIUM_AMM_POOLS.get(`${pair.tokenB}:${pair.tokenA}`);
         if (address) {
             found.push({ address, dex: 'Raydium AMM', pair });
-        } else {
-            logger.info(`[PoolWatcher] Raydium AMM v4: no hardcoded pool for ${pair.name}`);
         }
     }
 
@@ -132,8 +128,6 @@ async function fetchMeteoraPools(pairs) {
                 .sort((a, b) => parseFloat(b.liquidity || 0) - parseFloat(a.liquidity || 0));
             if (matches.length > 0) {
                 found.push({ address: matches[0].address, dex: 'Meteora', pair });
-            } else {
-                logger.info(`[PoolWatcher] Meteora: no pool found for ${pair.name}`);
             }
         }
         logger.debug(`[PoolWatcher] Meteora DLMM: ${found.length} pools found`);
@@ -192,19 +186,6 @@ class PoolWatcher {
         }
         const summary = Object.entries(byDex).map(([d, n]) => `${d}:${n}`).join(' | ');
         logger.info(`[PoolWatcher] ✅ ${this.subscriptions.length} subscriptions — ${summary}`);
-
-        // Per-pair coverage breakdown so we know exactly what's covered
-        const byPair = {};
-        for (const s of this.subscriptions) {
-            if (!byPair[s.pair.name]) byPair[s.pair.name] = [];
-            byPair[s.pair.name].push(s.dex);
-        }
-        for (const [name, dexes] of Object.entries(byPair)) {
-            const counts = {};
-            for (const d of dexes) counts[d] = (counts[d] || 0) + 1;
-            const detail = Object.entries(counts).map(([d, n]) => `${d}:${n}`).join(' ');
-            logger.info(`[PoolWatcher]   ${name} → ${dexes.length} subs (${detail})`);
-        }
     }
 
     _handleChange(pool, callback, accountInfo) {
@@ -212,9 +193,9 @@ class PoolWatcher {
         const last = this._debounce[pool.pair.name] || 0;
         if (now - last < DEBOUNCE_MS) return; // deduplicate within same slot
         this._debounce[pool.pair.name] = now;
-        logger.debug(`[PoolWatcher] 🔔 ${pool.dex} pool changed → ${pool.pair.name}`);
-        // Pass accountInfo through for local pool math pre-filtering
-        Promise.resolve().then(() => callback(pool.pair, accountInfo, pool.dex, pool.address)).catch(e => {
+        logger.debug(`[PoolWatcher] ${pool.dex} pool changed → scanning ${pool.pair.name}`);
+        // Pass accountInfo through for future local pool math pre-filtering
+        Promise.resolve().then(() => callback(pool.pair, accountInfo, pool.dex)).catch(e => {
             logger.error(`[PoolWatcher] Callback error [${pool.pair.name}]: ${e.message}`);
         });
     }

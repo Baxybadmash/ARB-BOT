@@ -1,0 +1,11 @@
+{
+  "pairs": [
+    { "name": "SOL/USDT",     "tokenA": "So11111111111111111111111111111111111111112", "tokenB": "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB", "decimalsA": 9, "decimalsB": 6, "isAnchor": true },
+    { "name": "SOL/USDC",     "tokenA": "So11111111111111111111111111111111111111112", "tokenB": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v", "decimalsA": 9, "decimalsB": 6 },
+    { "name": "SOL/BONK",     "tokenA": "So11111111111111111111111111111111111111112", "tokenB": "DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263", "decimalsA": 9, "decimalsB": 5 },
+    { "name": "SOL/WIF",      "tokenA": "So11111111111111111111111111111111111111112", "tokenB": "EKpQGSJtjMFqKZ9KQanSqYXRcF8fBopzLHYxdM65zcjm", "decimalsA": 9, "decimalsB": 6 },
+    { "name": "SOL/FARTCOIN", "tokenA": "So11111111111111111111111111111111111111112", "tokenB": "9BB6NFEcjBCtnNLFko2FqVQBq8HHM13kCyYcdQbgpump", "decimalsA": 9, "decimalsB": 6 }
+  ],
+  "updatedAt": "2026-03-20T00:00:00.000Z",
+  "nextUpdateAt": "2026-04-20T00:00:00.000Z"
+}

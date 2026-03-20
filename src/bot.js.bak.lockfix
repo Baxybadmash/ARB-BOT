@@ -191,12 +191,8 @@ async function startBot() {
     // Shared execute helper — used by both WS trigger and slot fallback
     async function tryExecute(opportunities, label, triggerTime) {
         if (opportunities.length === 0) return;
-        const best = opportunities[0];
-        if (best.spreadPct < 0.00005 && best.loanSizeSol <= 1) return;
-        if (isExecuting) {
-            if (best.spreadPct >= 0.00005) logger.info(`[${label}] Blocked(locked): ${best.pair.name} spread=${best.priceDiffPct}%`);
-            return;
-        }
+        if (isExecuting) return;
+
         isExecuting = true;
         try {
             let finalOpp = opportunities[0];

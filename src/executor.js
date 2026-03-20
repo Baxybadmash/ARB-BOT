@@ -1,4 +1,5 @@
 // src/executor.js
+const bs58 = require('bs58');
 // ============================================================
 //  MARGINFI FLASHLOAN ARB EXECUTOR
 //
@@ -88,8 +89,36 @@ class Executor {
         // Providing preloadedBankAddresses skips getProgramAccounts entirely.
         const mfiConn = new Connection(
             process.env.RPC_URL_SECONDARY || process.env.RPC_URL_PRIMARY,
-            'confirmed'
+            { commitment: 'confirmed', disableRetryOnRateLimit: true }
         );
+
+        // ---- 429 circuit breaker for MarginFi's Shyft connection ----
+        {
+            const MAX_CONCURRENT = 3;
+            const MIN_SPACING_MS = 100;
+            let inFlight = 0;
+            let lastCall = 0;
+            const origRpc = mfiConn._rpcRequest.bind(mfiConn);
+
+            mfiConn._rpcRequest = async function throttledRpc(method, args) {
+                const now = Date.now();
+                const wait = MIN_SPACING_MS - (now - lastCall);
+                if (wait > 0) await new Promise(r => setTimeout(r, wait));
+
+                while (inFlight >= MAX_CONCURRENT) {
+                    await new Promise(r => setTimeout(r, 50));
+                }
+
+                inFlight++;
+                lastCall = Date.now();
+                try {
+                    return await origRpc(method, args);
+                } finally {
+                    inFlight--;
+                }
+            };
+            logger.info('[Executor] 429 circuit breaker installed on MarginFi connection');
+        }
         const nodeWallet = new NodeWallet(this.wallet);
         const mfiConfig  = getConfig('production');
 
@@ -173,7 +202,7 @@ class Executor {
                 data.writeBigUInt64LE(amt, 8); // repayAll 0x0101 at [16] stays baked in
             } else if (data.length === 12 && data.readUInt32LE(0) === 2) {
                 // SystemProgram.Transfer (wrap SOL before repay): amount + 10000 extra lamports
-                data.writeBigUInt64LE(amt + 10000n, 4);
+                data.writeBigUInt64LE(10000n, 4);
             }
 
             return new TransactionInstruction({ programId: ix.programId, keys: ix.keys, data });
@@ -407,7 +436,7 @@ class Executor {
 
             const [buyIxData, sellIxData] = await Promise.all([
                 this._getSwapInstructions(bestBuyQuote),
-                this._getSwapInstructions(reverseQuote, 0),
+                this._getSwapInstructions(reverseQuote, 10),
             ]);
 
             // ── Step 3: Collect address lookup tables ─────────────────
@@ -506,7 +535,7 @@ class Executor {
             // ── Step 7: Submit via Jito + direct RPC simultaneously ──────
             // Both fire with the same signed tx — on-chain it's idempotent (same sig).
             // Eliminates the old 3s Jito-wait before fallback. No re-sign needed.
-            const serialized  = serializedBuf.toString('base64');
+            const serialized  = bs58.encode(serializedBuf);
             const jitoP       = this._submitJitoBundle([serialized]);
             const directP     = this.connection.sendRawTransaction(serializedBuf, {
                 skipPreflight: true,
@@ -531,7 +560,7 @@ class Executor {
                     const result = await Promise.race([
                         this.connection.confirmTransaction(
                             { signature: directSig, blockhash: finalBlockhash, lastValidBlockHeight: finalLastValidBlockHeight },
-                            'confirmed'
+                            { commitment: 'confirmed', disableRetryOnRateLimit: true }
                         ),
                         confirmTimeout,
                     ]);

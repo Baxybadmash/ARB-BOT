@@ -12,7 +12,6 @@ const https = require('https');
 const http  = require('http');
 const bs58       = require('bs58');
 const { PriceScanner, computeTargetLam }  = require('./scanner');
-const localPools = require('./localPools');
 const { Executor }                        = require('./executor');
 const { updatePairs, isUpdateDue, getUpdateStatus } = require('./pairUpdater');
 const { findOptimalLoanSize }                       = require('./loanSizer');
@@ -191,12 +190,8 @@ async function startBot() {
     // Shared execute helper — used by both WS trigger and slot fallback
     async function tryExecute(opportunities, label, triggerTime) {
         if (opportunities.length === 0) return;
-        const best = opportunities[0];
-        if (best.spreadPct < 0.00005 && best.loanSizeSol <= 1) return;
-        if (isExecuting) {
-            if (best.spreadPct >= 0.00005) logger.info(`[${label}] Blocked(locked): ${best.pair.name} spread=${best.priceDiffPct}%`);
-            return;
-        }
+        if (isExecuting) return;
+
         isExecuting = true;
         try {
             let finalOpp = opportunities[0];
@@ -234,35 +229,11 @@ async function startBot() {
     //  PRIMARY: WebSocket pool account subscriptions (~50-100ms)
     //  Fires immediately when a pool swap changes reserves.
     // -------------------------------------------------------
-    const wsCallback = async (pair, accountInfo, dex, poolAddress) => {
+    const wsCallback = async (pair) => {
         const now = Date.now();
         if (now - (lastWsScan.get(pair.name) || 0) < WS_DEBOUNCE_MS) return;
         lastWsScan.set(pair.name, now);
         executor.stats.slotsScanned++;
-
-        // ── LOCAL POOL MATH PRE-FILTER ──────────────────────────
-        // If this is an Orca Whirlpool, decode the fresh state instantly
-        // and check spread vs Binance price. Only call Jupiter if the
-        // spread exceeds the threshold. Saves 300-500ms per WS trigger.
-        if ((dex === 'Orca' || dex === 'Raydium CLMM' || dex === 'Meteora') && accountInfo && accountInfo.data && poolAddress && (pair.name.endsWith('/USDC') || pair.name.endsWith('/USDT'))) {
-                        const state = localPools.updatePoolState(poolAddress, accountInfo.data, dex);
-            if (state) {
-                const refPrice = getSolPrice();
-                if (refPrice > 0) {
-                    const poolPrice = localPools.getPoolPrice(state);
-                    if (poolPrice <= 0) return; // empty pool or decode error
-                    const spreadPct = Math.abs(poolPrice - refPrice) / refPrice;
-
-                    if (spreadPct < 0.0007) {
-                        logger.debug(`[WS-Local] ${pair.name} spread=${(spreadPct*100).toFixed(4)}% < 0.03% — skip`);
-                        return;
-                    }
-                    logger.info(`[WS-Local] ${pair.name} spread=${(spreadPct*100).toFixed(4)}% pool=$${poolPrice.toFixed(2)} ref=$${refPrice.toFixed(2)} — calling Jupiter`);
-                }
-            }
-        }
-
-        // ── JUPITER SCAN (only reached if local math says spread is interesting) ──
         try {
             const opps = await scanner.findOpportunitiesForPair(pair, minFlashloanLamports, flashloanLamports);
             await tryExecute(opps, 'WS', now);
@@ -273,16 +244,6 @@ async function startBot() {
 
     const poolWatcher = new PoolWatcher(connection);
     await poolWatcher.subscribe(scanner.activePairs, wsCallback);
-
-    // Register Orca Whirlpool pools for local math pre-filtering
-    let localCount = 0;
-    for (const sub of poolWatcher.subscriptions) {
-        if (sub.dex === 'Orca' || sub.dex === 'Raydium CLMM' || sub.dex === 'Meteora') {
-            localPools.registerPool(sub.address, sub.pair, sub.dex);
-            localCount++;
-        }
-    }
-    logger.info('[LocalPools] Registered ' + localCount + ' pools (Orca + Raydium CLMM) for local math');
 
     // -------------------------------------------------------
     //  FALLBACK: Slot polling — catches pairs without WS subs

@@ -358,43 +358,28 @@ class PriceScanner {
     //  tryExecute right before execution to get exact quotes.
     // -------------------------------------------------------
     async reSizeScan(pair, targetLam) {
-        const minLam = 1_000_000_000; // 1 SOL floor
-        const attempts = [
-            targetLam,
-            Math.floor(targetLam * 0.6),
-            Math.floor(targetLam * 0.4),
-        ].filter(lam => lam >= minLam);
-        const unique = [...new Set(attempts)];
-
-        for (const lam of unique) {
-            const buyFull = await _jupiterQuoteFast(pair.tokenA, pair.tokenB, lam);
-            if (!buyFull?.outAmount) continue;
-            const tokenOut = BigInt(buyFull.outAmount);
-            const sellFull = await _jupiterQuoteFast(pair.tokenB, pair.tokenA, tokenOut.toString());
-            if (!sellFull?.outAmount) continue;
-            const profit = BigInt(sellFull.outAmount) - BigInt(lam);
-            if (profit <= 0n) continue;
-            const spreadPct = Number(profit) / lam;
-            const solSize = lam / 1e9;
-            if (lam < targetLam) {
-                logger.info(`[reSizeScan] ${pair.name} step-down hit: ${solSize} SOL (target was ${targetLam/1e9})`);
-            }
-            return {
-                pair,
-                amountIn:        BigInt(lam),
-                loanSizeSol:     solSize,
-                grossProfit:     profit,
-                spreadPct,
-                priceDiffPct:    (Math.abs(spreadPct) * 100).toFixed(3),
-                bestDex:         'Jupiter',
-                bestBuyQuote:    buyFull,
-                reverseQuote:    sellFull,
-                amountAfterBuy:  tokenOut,
-                amountAfterSell: BigInt(sellFull.outAmount),
-            };
-        }
-        return null;
+        const buyFull = await _jupiterQuoteFast(pair.tokenA, pair.tokenB, targetLam);
+        if (!buyFull?.outAmount) return null;
+        const tokenOut = BigInt(buyFull.outAmount);
+        const sellFull = await _jupiterQuoteFast(pair.tokenB, pair.tokenA, tokenOut.toString());
+        if (!sellFull?.outAmount) return null;
+        const profit = BigInt(sellFull.outAmount) - BigInt(targetLam);
+        if (profit <= 0n) return null;
+        const spreadPct = Number(profit) / targetLam;
+        return {
+            pair,
+            amountIn:        BigInt(targetLam),
+            loanSizeSol:     targetLam / 1e9,
+            grossProfit:     profit,
+            spreadPct,
+            priceDiffPct:    (Math.abs(spreadPct) * 100).toFixed(3),
+            bestDex:         'Jupiter',
+            bestBuyQuote:    buyFull,
+            reverseQuote:    sellFull,
+            amountAfterBuy:  tokenOut,
+            amountAfterSell: BigInt(sellFull.outAmount),
+        };
     }
-
 }
+
 module.exports = { PriceScanner, DEFAULT_PAIRS, computeTargetLam: _computeTargetLam };

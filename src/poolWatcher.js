@@ -20,7 +20,7 @@ const DEBOUNCE_MS = 50; // deduplicate rapid multi-pool fires for same pair; rea
 //  pools that don't exist simply never fire.
 // -------------------------------------------------------
 const WHIRLPOOL_PROGRAM = new PublicKey('whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc');
-const ORCA_CONFIG       = new PublicKey('2LecshUwdy9xi7meFgHZFAxnRRKFZC8CdCXQSQCDfxFu');
+const ORCA_CONFIG       = new PublicKey('2LecshUwdy9xi7meFgHtFJQNSKk4KdTrcpvaB56dP2NQ');
 // Tick spacings for fee tiers: 0.01%, 0.05%, 0.3%, 1%, 2% + Splash pools
 const ORCA_TICK_SPACINGS = [1, 8, 64, 128, 256, 32768];
 
@@ -118,28 +118,25 @@ async function fetchRaydiumPools(pairs) {
     return found;
 }
 
+// Meteora DLMM pool addresses — hardcoded because dlmm-api.meteora.ag/pair/all is decommissioned (404).
+// Verified 2026-03-26 via DexScreener + Helius on-chain owner check (LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo).
+// SOL/USDT and SOL/USDC have no Meteora DLMM pools; those pairs are covered by Orca + Raydium.
+const METEORA_DLMM_POOLS = new Map([
+    ['So11111111111111111111111111111111111111112:DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263', '6oFWm7KPLfxnwMb3z5xwBoXNSPP3JJyirAPqPSiVcnsp'], // SOL/BONK     — $361K liq
+    ['So11111111111111111111111111111111111111112:EKpQGSJtjMFqKZ9KQanSqYXRcF8fBopzLHYxdM65zcjm', '8Ve9KtGNtLRxCQNAVfkHEP5GRZHjdj6BjB1RQFZewG6V'], // SOL/WIF      — $5.9K liq
+    ['So11111111111111111111111111111111111111112:9BB6NFEcjBCtnNLFko2FqVQBq8HHM13kCyYcdQbgpump', '6wJ7W3oHj7ex6MVFp2o26NSof3aey7U8Brs8E371WCXA'], // SOL/FARTCOIN — $118K liq
+]);
+
 async function fetchMeteoraPools(pairs) {
     const found = [];
-    try {
-        const res = await axios.get('https://dlmm-api.meteora.ag/pair/all', { timeout: 10000 });
-        const pools = res.data || [];
-        for (const pair of pairs) {
-            const matches = pools
-                .filter(p =>
-                    (p.mint_x === pair.tokenA && p.mint_y === pair.tokenB) ||
-                    (p.mint_x === pair.tokenB && p.mint_y === pair.tokenA)
-                )
-                .sort((a, b) => parseFloat(b.liquidity || 0) - parseFloat(a.liquidity || 0));
-            if (matches.length > 0) {
-                found.push({ address: matches[0].address, dex: 'Meteora', pair });
-            } else {
-                logger.info(`[PoolWatcher] Meteora: no pool found for ${pair.name}`);
-            }
+    for (const pair of pairs) {
+        const address = METEORA_DLMM_POOLS.get(`${pair.tokenA}:${pair.tokenB}`)
+                     || METEORA_DLMM_POOLS.get(`${pair.tokenB}:${pair.tokenA}`);
+        if (address) {
+            found.push({ address, dex: 'Meteora', pair });
         }
-        logger.debug(`[PoolWatcher] Meteora DLMM: ${found.length} pools found`);
-    } catch (e) {
-        logger.warn(`[PoolWatcher] Meteora pool fetch failed: ${e.message}`);
     }
+    logger.debug(`[PoolWatcher] Meteora DLMM: ${found.length} pools found (hardcoded)`);
     return found;
 }
 

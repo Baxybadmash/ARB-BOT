@@ -34,6 +34,9 @@ const REPAY_DISCRIMINATOR  = Buffer.from([0x4f, 0xd1, 0xac, 0xb1, 0xde, 0x33, 0x
 // swap-instructions endpoint rejects API key with 401 — use lite-api directly
 const JUPITER_SWAP_API  = 'https://lite-api.jup.ag/swap/v1';
 
+// Vote program ID — used to filter vote accounts from ALTs (Jito rejects bundles that lock vote accounts)
+const VOTE_PROGRAM_ID = 'Vote111111111111111111111111111111111111111';
+
 // Jito tip accounts — one is picked per bundle submission
 // Source: https://jito-labs.gitbook.io/mev/searcher-resources/bundles
 const JITO_TIP_ACCOUNTS = [
@@ -202,7 +205,7 @@ class Executor {
                 data.writeBigUInt64LE(amt, 8); // repayAll 0x0101 at [16] stays baked in
             } else if (data.length === 12 && data.readUInt32LE(0) === 2) {
                 // SystemProgram.Transfer (wrap SOL before repay): amount + 10000 extra lamports
-                data.writeBigUInt64LE(10000n, 4);
+                data.writeBigUInt64LE(100000n, 4);
             }
 
             return new TransactionInstruction({ programId: ix.programId, keys: ix.keys, data });
@@ -254,19 +257,37 @@ class Executor {
     // -------------------------------------------------------
     //  PROFITABILITY CHECK
     //  grossProfit is in SOL lamports (scanner output).
-    //  Deduct: Jito tip + tx fees + MarginFi flashloan fee.
+    //  Deduct: dynamic Jito tip + tx fees + MarginFi flashloan fee.
+    //  Tip = 50% of gross profit, floored at 50K and capped at 5M lamports.
     // -------------------------------------------------------
     async isProfitable(grossProfit, amountIn) {
         const minProfitUsd    = parseFloat(process.env.MIN_PROFIT_USD || this.config.MIN_PROFIT_USD || '1.5');
         const solPrice        = getSolPrice();
-        const jitoTip         = BigInt(process.env.JITO_TIP_LAMPORTS  || '50000');
+        const tipPct          = parseFloat(process.env.JITO_TIP_PCT || '0.50');
+        const tipFloor        = BigInt(process.env.JITO_TIP_FLOOR || '50000');     // 50K min
+        const tipCeiling      = BigInt(process.env.JITO_TIP_CEILING || '5000000'); // 5M max (~$0.70)
+        const dynamicTip      = grossProfit * BigInt(Math.floor(tipPct * 100)) / 100n;
+        const jitoTip         = dynamicTip < tipFloor ? tipFloor : dynamicTip > tipCeiling ? tipCeiling : dynamicTip;
         const txFee           = 10000n;                           // ~2 txs × 5000 lamports
-        const flashloanFee    = (amountIn * FLASHLOAN_FEE_BPS) / 10000n; // 0.09% of loan
+        const flashloanFee    = (amountIn * FLASHLOAN_FEE_BPS) / 10000n;
 
         const minProfitLamports = BigInt(Math.ceil((minProfitUsd / solPrice) * 1e9));
         const totalCosts        = jitoTip + txFee + flashloanFee;
 
         return grossProfit > minProfitLamports + totalCosts;
+    }
+
+    // -------------------------------------------------------
+    //  COMPUTE DYNAMIC JITO TIP
+    //  50% of gross profit, floored at 50K, capped at 5M lamports.
+    //  Called during tx building to get the actual tip amount.
+    // -------------------------------------------------------
+    _computeJitoTip(grossProfit) {
+        const tipPct     = parseFloat(process.env.JITO_TIP_PCT || '0.50');
+        const tipFloor   = BigInt(process.env.JITO_TIP_FLOOR || '50000');
+        const tipCeiling = BigInt(process.env.JITO_TIP_CEILING || '5000000');
+        const dynamicTip = grossProfit * BigInt(Math.floor(tipPct * 100)) / 100n;
+        return dynamicTip < tipFloor ? tipFloor : dynamicTip > tipCeiling ? tipCeiling : dynamicTip;
     }
 
     // -------------------------------------------------------
@@ -362,28 +383,53 @@ class Executor {
 
     // -------------------------------------------------------
     //  SUBMIT VIA JITO BUNDLE
+    //  Submits to mainnet (global) + Frankfurt + Amsterdam simultaneously.
+    //  Logs EVERY response from EVERY endpoint — both HTTP errors and
+    //  JSON-RPC errors (HTTP 200 with data.error) which were previously silent.
     // -------------------------------------------------------
     async _submitJitoBundle(serializedTxs) {
-        // Submit to multiple Jito regions simultaneously — first accepted wins.
-        // Frankfurt (~0ms from VPS) + Amsterdam (~10ms) for EU coverage.
         const primary   = process.env.JITO_BLOCK_ENGINE_URL || 'https://frankfurt.mainnet.block-engine.jito.wtf';
-        const endpoints = [...new Set([primary, 'https://amsterdam.mainnet.block-engine.jito.wtf'])]
-            .map(url => `${url}/api/v1/bundles`);
+        const endpoints = [...new Set([
+            'https://mainnet.block-engine.jito.wtf',           // global — primary in all Jito docs
+            primary,                                            // Frankfurt (closest to VPS)
+            'https://amsterdam.mainnet.block-engine.jito.wtf', // Amsterdam backup
+        ])].map(url => `${url}/api/v1/bundles`);
 
         const payload = { jsonrpc: '2.0', id: 1, method: 'sendBundle', params: [serializedTxs] };
         const results  = await Promise.allSettled(
             endpoints.map(url => axios.post(url, payload, { timeout: 3000 }))
         );
 
-        for (const r of results) {
-            if (r.status === 'fulfilled' && r.value?.data?.result) return r.value.data.result;
+        // Check for success first — any endpoint returning a bundleId wins
+        for (let i = 0; i < results.length; i++) {
+            const r = results[i];
+            if (r.status === 'fulfilled' && r.value?.data?.result) {
+                logger.info(`[Executor] ✅ Jito bundle accepted via ${endpoints[i]}: ${r.value.data.result}`);
+                return r.value.data.result;
+            }
         }
 
-        const fail = results.find(r => r.status === 'rejected');
-        if (fail) {
-            const e      = fail.reason;
-            const detail = e.response?.data?.error?.message || e.response?.data?.message || e.message;
-            logger.warn(`[Executor] Jito bundle failed: ${detail}`);
+        // No success — log ALL errors from ALL endpoints for diagnosis
+        for (let i = 0; i < results.length; i++) {
+            const r   = results[i];
+            const ep  = endpoints[i].replace('https://', '').replace('.mainnet.block-engine.jito.wtf/api/v1/bundles', '');
+
+            if (r.status === 'fulfilled' && r.value?.data?.error) {
+                // HTTP 200 but JSON-RPC error — these were previously SILENT
+                const err    = r.value.data.error;
+                const detail = err.message || JSON.stringify(err);
+                logger.warn(`[Executor] Jito [${ep}] rejected (200): ${detail}`);
+            } else if (r.status === 'fulfilled') {
+                // HTTP 200 but no result and no error — unexpected
+                logger.debug(`[Executor] Jito [${ep}] returned 200 with no result/error: ${JSON.stringify(r.value?.data)}`);
+            } else if (r.status === 'rejected') {
+                const e      = r.reason;
+                const detail = e.response?.data?.error?.message
+                    || e.response?.data?.message
+                    || e.message;
+                const status = e.response?.status || 'network';
+                logger.warn(`[Executor] Jito [${ep}] failed (${status}): ${detail}`);
+            }
         }
         return null;
     }
@@ -436,7 +482,7 @@ class Executor {
 
             const [buyIxData, sellIxData] = await Promise.all([
                 this._getSwapInstructions(bestBuyQuote),
-                this._getSwapInstructions(reverseQuote, 10),
+                this._getSwapInstructions(reverseQuote, 0),
             ]);
 
             // ── Step 3: Collect address lookup tables ─────────────────
@@ -475,8 +521,11 @@ class Executor {
                 return !seenSetup.has(key);
             });
 
-            // Jito tip instruction — required for bundle acceptance
-            const jitoTipLamports = BigInt(process.env.JITO_TIP_LAMPORTS || '50000');
+            // Jito tip instruction — dynamic: 50% of gross profit (floor 50K, cap 5M lamports)
+            const jitoTipLamports = this._computeJitoTip(grossProfit);
+            const solPrice2       = getSolPrice();
+            const tipUsd          = (Number(jitoTipLamports) / 1e9 * solPrice2).toFixed(4);
+            logger.info(`[Executor] Jito tip: ${jitoTipLamports} lamports (~$${tipUsd}) | ${((Number(jitoTipLamports) / Number(grossProfit)) * 100).toFixed(0)}% of gross`);
             const jitoTipAccount  = new PublicKey(
                 JITO_TIP_ACCOUNTS[Math.floor(Math.random() * JITO_TIP_ACCOUNTS.length)]
             );
@@ -517,6 +566,104 @@ class Executor {
             // ── Step 6: Sign ──────────────────────────────────────────
             flashTx.sign([this.wallet]);
 
+            // ── Step 6b: Vote account diagnostic ──────────────────────
+            // Jito rejects bundles that reference ANY vote account — even
+            // read-only ALT entries. Check ALL accounts in the tx.
+            try {
+                const msg = flashTx.message;
+                const numSigners    = msg.header.numRequiredSignatures;
+                const numReadonlyS  = msg.header.numReadonlySignedAccounts;
+                const numReadonlyU  = msg.header.numReadonlyUnsignedAccounts;
+                const staticKeys    = msg.staticAccountKeys.map(k => k.toString());
+                const totalStatic   = staticKeys.length;
+                const writableSignerCount    = numSigners - numReadonlyS;
+                const readonlyUnsignedStart  = totalStatic - numReadonlyU;
+
+                const writableKeys = [];
+                const readonlyKeys = [];
+                for (let i = 0; i < totalStatic; i++) {
+                    const isReadonlySigner   = (i >= writableSignerCount && i < numSigners);
+                    const isReadonlyUnsigned = (i >= readonlyUnsignedStart);
+                    if (!isReadonlySigner && !isReadonlyUnsigned) {
+                        writableKeys.push(staticKeys[i]);
+                    } else {
+                        readonlyKeys.push(staticKeys[i]);
+                    }
+                }
+
+                // Collect ALL accounts from ALT lookups (writable + readonly)
+                const altWritableKeys = [];
+                const altReadonlyKeys = [];
+                if (msg.addressTableLookups) {
+                    for (const lookup of msg.addressTableLookups) {
+                        const table = lookupTables.find(t => t.key.equals(lookup.accountKey));
+                        if (!table) continue;
+                        const altAddr = lookup.accountKey.toString();
+                        for (const idx of (lookup.writableIndexes || [])) {
+                            const addr = table.state.addresses[idx];
+                            if (addr) {
+                                writableKeys.push(addr.toString());
+                                altWritableKeys.push({ addr: addr.toString(), alt: altAddr.slice(0, 12), idx });
+                            }
+                        }
+                        for (const idx of (lookup.readonlyIndexes || [])) {
+                            const addr = table.state.addresses[idx];
+                            if (addr) {
+                                readonlyKeys.push(addr.toString());
+                                altReadonlyKeys.push({ addr: addr.toString(), alt: altAddr.slice(0, 12), idx });
+                            }
+                        }
+                    }
+                }
+
+                const allKeys = [...new Set([...writableKeys, ...readonlyKeys])];
+                const altAddrs = (msg.addressTableLookups || []).map(l => l.accountKey.toString());
+                logger.info(`[Executor] Tx accounts: ${writableKeys.length} writable + ${readonlyKeys.length} readonly = ${allKeys.length} unique | ${altAddrs.length} ALTs`);
+                if (altAddrs.length > 0) {
+                    logger.debug(`[Executor] ALT addresses: ${altAddrs.join(', ')}`);
+                }
+
+                // On-chain check: fetch owners of ALL accounts to find vote accounts
+                if (allKeys.length > 0 && allKeys.length <= 200) {
+                    try {
+                        // Batch in groups of 100
+                        const voteAccounts = [];
+                        for (let b = 0; b < allKeys.length; b += 100) {
+                            const batch = allKeys.slice(b, b + 100);
+                            const infos = await this.connection.getMultipleAccountsInfo(
+                                batch.map(k => new PublicKey(k)),
+                                { commitment: 'confirmed' }
+                            );
+                            for (let i = 0; i < infos.length; i++) {
+                                if (infos[i] && infos[i].owner.toString() === VOTE_PROGRAM_ID) {
+                                    const key = batch[i];
+                                    const isWritable = writableKeys.includes(key);
+                                    const altEntry = [...altWritableKeys, ...altReadonlyKeys].find(e => e.addr === key);
+                                    const source = altEntry
+                                        ? `ALT ${altEntry.alt}... idx=${altEntry.idx} (${isWritable ? 'WRITABLE' : 'READONLY'})`
+                                        : `static (${isWritable ? 'WRITABLE' : 'READONLY'})`;
+                                    voteAccounts.push({ key, source });
+                                }
+                            }
+                        }
+                        if (voteAccounts.length > 0) {
+                            for (const va of voteAccounts) {
+                                logger.warn(`[Executor] ⚠️  VOTE ACCOUNT: ${va.key} | Source: ${va.source}`);
+                            }
+                            logger.warn(`[Executor] ${voteAccounts.length} vote account(s) found — Jito will reject. Pair: ${pair.name}`);
+                        } else {
+                            logger.info(`[Executor] ✅ No vote accounts in tx (${allKeys.length} checked)`);
+                        }
+                    } catch (voteCheckErr) {
+                        logger.debug(`[Executor] Vote account on-chain check failed: ${voteCheckErr.message}`);
+                    }
+                } else {
+                    logger.debug(`[Executor] Skipping vote check — ${allKeys.length} accounts (outside 1-200 range)`);
+                }
+            } catch (diagErr) {
+                logger.debug(`[Executor] Vote diagnostic error: ${diagErr.message}`);
+            }
+
             // Guard: Solana versioned transactions are capped at 1232 bytes.
             // Serialize once after signing — used for both size check and Jito submission.
             // Note: serialize() throws "encoding overruns Uint8Array" when the tx is too
@@ -531,6 +678,26 @@ class Executor {
                 throw new Error(`Transaction too large: ${serializedBuf.length} bytes (limit 1232). Reduce JUPITER_MAX_ACCOUNTS.`);
             }
             logger.debug(`[Executor] Tx size: ${serializedBuf.length} bytes`);
+            // ── Step 6c: Simulate before submission (~50ms) ─────────────
+            // Catches bad trades instantly instead of wasting 30s on confirmation timeout.
+            try {
+                const simResult = await this.connection.simulateTransaction(flashTx, {
+                    replaceRecentBlockhash: false,
+                    sigVerify: false,
+                });
+                if (simResult.value.err) {
+                    const errStr = JSON.stringify(simResult.value.err);
+                    logger.warn(`[Executor] Simulation FAILED — skipping submission: ${errStr}`);
+                    const logs = (simResult.value.logs || []).slice(-5).join(' | ');
+                    logger.debug(`[Executor] Sim logs (last 5): ${logs}`);
+                    this.stats.txFailed++;
+                    return { success: false, reason: `sim-failed: ${errStr}` };
+                }
+                logger.debug(`[Executor] Simulation OK — CU used: ${simResult.value.unitsConsumed}`);
+            } catch (simErr) {
+                // RPC sim call itself failed (network issue) — proceed with submission anyway
+                logger.warn(`[Executor] Simulation RPC error (proceeding): ${simErr.message}`);
+            }
 
             // ── Step 7: Submit via Jito + direct RPC simultaneously ──────
             // Both fire with the same signed tx — on-chain it's idempotent (same sig).

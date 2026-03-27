@@ -234,6 +234,9 @@ async function startBot() {
     //  PRIMARY: WebSocket pool account subscriptions (~50-100ms)
     //  Fires immediately when a pool swap changes reserves.
     // -------------------------------------------------------
+    const lastJupiterCall = new Map();
+    const JUPITER_COOLDOWN_MS = parseInt(process.env.JUPITER_COOLDOWN_MS || '3000');
+
     const wsCallback = async (pair, accountInfo, dex, poolAddress) => {
         const now = Date.now();
         if (now - (lastWsScan.get(pair.name) || 0) < WS_DEBOUNCE_MS) return;
@@ -241,11 +244,13 @@ async function startBot() {
         executor.stats.slotsScanned++;
 
         // ── LOCAL POOL MATH PRE-FILTER ──────────────────────────
-        // If this is an Orca Whirlpool, decode the fresh state instantly
-        // and check spread vs Binance price. Only call Jupiter if the
-        // spread exceeds the threshold. Saves 300-500ms per WS trigger.
-        if ((dex === 'Orca' || dex === 'Raydium CLMM' || dex === 'Meteora') && accountInfo && accountInfo.data && poolAddress && (pair.name.endsWith('/USDC') || pair.name.endsWith('/USDT'))) {
-                        const state = localPools.updatePoolState(poolAddress, accountInfo.data, dex);
+        // For supported dexes: decode pool state locally, compute spread
+        // vs Binance price. Skip Jupiter entirely if spread is too thin.
+        const hasLocalMath = (dex === 'Orca' || dex === 'Raydium CLMM' || dex === 'Meteora') && (pair.name.endsWith('/USDC') || pair.name.endsWith('/USDT'))
+            && accountInfo && accountInfo.data && poolAddress;
+
+        if (hasLocalMath) {
+            const state = localPools.updatePoolState(poolAddress, accountInfo.data, dex);
             if (state) {
                 const refPrice = getSolPrice();
                 if (refPrice > 0) {
@@ -254,16 +259,22 @@ async function startBot() {
                     const spreadPct = Math.abs(poolPrice - refPrice) / refPrice;
 
                     if (spreadPct < 0.0007) {
-                        logger.debug(`[WS-Local] ${pair.name} spread=${(spreadPct*100).toFixed(4)}% < 0.03% — skip`);
+                        logger.debug(`[WS-Local] ${pair.name} spread=${(spreadPct*100).toFixed(4)}% < 0.07% — skip`);
                         return;
                     }
-                    logger.info(`[WS-Local] ${pair.name} spread=${(spreadPct*100).toFixed(4)}% pool=$${poolPrice.toFixed(2)} ref=$${refPrice.toFixed(2)} — calling Jupiter`);
+                    logger.info(`[WS-Local] ${pair.name} spread=${(spreadPct*100).toFixed(4)}% pool=$${poolPrice.toFixed(2)} ref=$${refPrice.toFixed(2)} dex=${dex}`);
                 }
             }
+            // If local math decode failed (no state), fall through to Jupiter as safety net
         }
 
-        // ── JUPITER SCAN (only reached if local math says spread is interesting) ──
+        // ── JUPITER COOLDOWN — applies to ALL events reaching this point ──
+        if (now - (lastJupiterCall.get(pair.name) || 0) < JUPITER_COOLDOWN_MS) return;
+        lastJupiterCall.set(pair.name, now);
+
+        // ── JUPITER SCAN ──
         try {
+            logger.info(`[WS] ${pair.name} → Jupiter scan (dex=${dex})`);
             const opps = await scanner.findOpportunitiesForPair(pair, minFlashloanLamports, flashloanLamports);
             await tryExecute(opps, 'WS', now);
         } catch (e) {

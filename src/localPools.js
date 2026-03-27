@@ -2,7 +2,7 @@
 const { PublicKey } = require('@solana/web3.js');
 
 // ── Orca Whirlpool (653 bytes) ──
-const ORCA = { FEE_RATE:45, LIQUIDITY:49, SQRT_PRICE:65, TICK_CURRENT:81, MINT_A:101, MINT_B:181, DATA_LEN:653, FEE_DENOM:1_000_000n };
+const ORCA = { TICK_SPACING:43, FEE_RATE:45, LIQUIDITY:49, SQRT_PRICE:65, TICK_CURRENT:81, MINT_A:101, VAULT_A:133, MINT_B:181, VAULT_B:213, DATA_LEN:653, FEE_DENOM:1_000_000n };
 
 // ── Raydium CLMM (1544 bytes) ──
 const RAYDIUM = { MINT_A:73, MINT_B:105, LIQUIDITY:237, SQRT_PRICE:253, TICK_CURRENT:269, DATA_LEN:1544, DEFAULT_FEE:100n, FEE_DENOM:1_000_000n };
@@ -30,8 +30,11 @@ function decodePoolState(data, dexType) {
     if (dexType === 'Orca' && data.length >= ORCA.DATA_LEN) {
         return { dexType:'Orca', sqrtPrice:readU128(data,ORCA.SQRT_PRICE), liquidity:readU128(data,ORCA.LIQUIDITY),
             tickCurrent:data.readInt32LE(ORCA.TICK_CURRENT), feeRate:BigInt(data.readUInt16LE(ORCA.FEE_RATE)), feeDenom:ORCA.FEE_DENOM,
+            tickSpacing:data.readUInt16LE(ORCA.TICK_SPACING),
             mintA:new PublicKey(data.slice(ORCA.MINT_A,ORCA.MINT_A+32)).toBase58(),
-            mintB:new PublicKey(data.slice(ORCA.MINT_B,ORCA.MINT_B+32)).toBase58() };
+            vaultA:new PublicKey(data.slice(ORCA.VAULT_A,ORCA.VAULT_A+32)).toBase58(),
+            mintB:new PublicKey(data.slice(ORCA.MINT_B,ORCA.MINT_B+32)).toBase58(),
+            vaultB:new PublicKey(data.slice(ORCA.VAULT_B,ORCA.VAULT_B+32)).toBase58() };
     }
 
     if (dexType === 'Raydium CLMM' && data.length >= RAYDIUM.DATA_LEN) {

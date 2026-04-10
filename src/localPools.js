@@ -5,9 +5,12 @@ const { PublicKey } = require('@solana/web3.js');
 const ORCA = { TICK_SPACING:43, FEE_RATE:45, LIQUIDITY:49, SQRT_PRICE:65, TICK_CURRENT:81, MINT_A:101, VAULT_A:133, MINT_B:181, VAULT_B:213, DATA_LEN:653, FEE_DENOM:1_000_000n };
 
 // ── Raydium CLMM (1544 bytes) ──
-const RAYDIUM = { MINT_A:73, MINT_B:105, LIQUIDITY:237, SQRT_PRICE:253, TICK_CURRENT:269, DATA_LEN:1544, DEFAULT_FEE:100n, FEE_DENOM:1_000_000n };
+const RAYDIUM = { AMM_CONFIG:9, MINT_A:73, MINT_B:105, VAULT_A:137, VAULT_B:169, OBSERVATION_KEY:201, TICK_SPACING:235, LIQUIDITY:237, SQRT_PRICE:253, TICK_CURRENT:269, DATA_LEN:1544, DEFAULT_FEE:100n, FEE_DENOM:1_000_000n };
 
 // ── Meteora DLMM (904 bytes) ──
+
+// ── Raydium AMM v4 (752 bytes) ──
+const RAYDIUM_AMM = { COIN_VAULT_AMOUNT:208, PC_VAULT_AMOUNT:216, MINT_A:400, MINT_B:432, DATA_LEN:752, FEE_NUM:9975n, FEE_DENOM:10000n };
 const METEORA = { MINT_X:88, MINT_Y:120, BIN_STEP:80, ACTIVE_BIN_ID:48, DATA_LEN:904 };
 
 const Q64 = 1n << 64n;
@@ -24,6 +27,7 @@ function decodePoolState(data, dexType) {
         if (data.length === ORCA.DATA_LEN) dexType = 'Orca';
         else if (data.length === RAYDIUM.DATA_LEN) dexType = 'Raydium CLMM';
         else if (data.length === METEORA.DATA_LEN) dexType = 'Meteora';
+        else if (data.length === RAYDIUM_AMM.DATA_LEN) dexType = 'Raydium AMM';
         else return null;
     }
 
@@ -41,7 +45,12 @@ function decodePoolState(data, dexType) {
         return { dexType:'Raydium CLMM', sqrtPrice:readU128(data,RAYDIUM.SQRT_PRICE), liquidity:readU128(data,RAYDIUM.LIQUIDITY),
             tickCurrent:data.readInt32LE(RAYDIUM.TICK_CURRENT), feeRate:null, feeDenom:RAYDIUM.FEE_DENOM,
             mintA:new PublicKey(data.slice(RAYDIUM.MINT_A,RAYDIUM.MINT_A+32)).toBase58(),
-            mintB:new PublicKey(data.slice(RAYDIUM.MINT_B,RAYDIUM.MINT_B+32)).toBase58() };
+            mintB:new PublicKey(data.slice(RAYDIUM.MINT_B,RAYDIUM.MINT_B+32)).toBase58(),
+            vaultA:new PublicKey(data.slice(RAYDIUM.VAULT_A,RAYDIUM.VAULT_A+32)).toBase58(),
+            vaultB:new PublicKey(data.slice(RAYDIUM.VAULT_B,RAYDIUM.VAULT_B+32)).toBase58(),
+            ammConfig:new PublicKey(data.slice(RAYDIUM.AMM_CONFIG,RAYDIUM.AMM_CONFIG+32)).toBase58(),
+            observationKey:new PublicKey(data.slice(RAYDIUM.OBSERVATION_KEY,RAYDIUM.OBSERVATION_KEY+32)).toBase58(),
+            tickSpacing:data.readUInt16LE(RAYDIUM.TICK_SPACING) };
     }
 
     if (dexType === 'Meteora' && data.length >= METEORA.DATA_LEN) {
@@ -51,6 +60,15 @@ function decodePoolState(data, dexType) {
             sqrtPrice:0n, liquidity:0n, tickCurrent:0,
             mintA:new PublicKey(data.slice(METEORA.MINT_X,METEORA.MINT_X+32)).toBase58(),
             mintB:new PublicKey(data.slice(METEORA.MINT_Y,METEORA.MINT_Y+32)).toBase58() };
+    }
+
+    if (dexType === 'Raydium AMM' && data.length >= RAYDIUM_AMM.DATA_LEN) {
+        return { dexType:'Raydium AMM',
+            mintA:new PublicKey(data.slice(RAYDIUM_AMM.MINT_A,RAYDIUM_AMM.MINT_A+32)).toBase58(),
+            mintB:new PublicKey(data.slice(RAYDIUM_AMM.MINT_B,RAYDIUM_AMM.MINT_B+32)).toBase58(),
+            reserveA:data.readBigUInt64LE(RAYDIUM_AMM.COIN_VAULT_AMOUNT),
+            reserveB:data.readBigUInt64LE(RAYDIUM_AMM.PC_VAULT_AMOUNT) / 100n,
+            sqrtPrice:0n, liquidity:0n, tickCurrent:0, feeRate:null, feeDenom:RAYDIUM_AMM.FEE_DENOM };
     }
 
     return null;
@@ -68,6 +86,8 @@ function updatePoolState(addr, data, dexType) {
     const state = decodePoolState(data, dexType || reg.dexType);
     if (!state) return null;
     if (state.feeRate === null) state.feeRate = reg.feeRate || RAYDIUM.DEFAULT_FEE;
+    const prev = poolCache.get(addr);
+    const priceChanged = !prev || prev.sqrtPrice !== state.sqrtPrice;
     const cached = { ...state, pairName:reg.pairName, tokenA:reg.tokenA, tokenB:reg.tokenB,
         decimalsA:reg.decimalsA, decimalsB:reg.decimalsB, lastUpdate:Date.now() };
     poolCache.set(addr, cached);
@@ -79,6 +99,19 @@ function getPoolsForPair(n) { const r=[]; for(const[a,s]of poolCache){if(s.pairN
 
 function computeSwap(inputMint, outputMint, amountIn, ps) {
     if (!ps) return null;
+    // Raydium AMM v4 constant-product swap
+    if (ps.dexType === 'Raydium AMM') {
+        if (!ps.reserveA || !ps.reserveB || ps.reserveA === 0n || ps.reserveB === 0n) return null;
+        const isAtoB = inputMint === ps.mintA;
+        if (!isAtoB && inputMint !== ps.mintB) return null;
+        const reserveIn  = isAtoB ? ps.reserveA : ps.reserveB;
+        const reserveOut = isAtoB ? ps.reserveB : ps.reserveA;
+        const amtWithFee = amountIn * RAYDIUM_AMM.FEE_NUM;
+        const out = (reserveOut * amtWithFee) / (reserveIn * RAYDIUM_AMM.FEE_DENOM + amtWithFee);
+        if (out <= 0n) return null;
+        const priceImpactBps = Number(amountIn * 10000n / (reserveIn + amountIn));
+        return { amountOut:out, newSqrtPrice:0n, priceImpactBps };
+    }
     // CLMM swap math (Orca + Raydium)
     if (ps.dexType !== 'Meteora') {
         if (ps.liquidity === 0n) return null;
@@ -109,6 +142,11 @@ function computeSwap(inputMint, outputMint, amountIn, ps) {
 
 function getPoolPrice(s) {
     if (!s) return 0;
+    // Raydium AMM v4: constant-product price
+    if (s.dexType === 'Raydium AMM') {
+        if (!s.reserveA || !s.reserveB || s.reserveA === 0n || s.reserveB === 0n) return 0;
+        return (Number(s.reserveB) / Number(s.reserveA)) * (10 ** (s.decimalsA - s.decimalsB));
+    }
     // Meteora DLMM: price from binStep + activeBinId
     if (s.dexType === 'Meteora') {
         if (!s.binStep || s.activeBinId === undefined) return 0;
@@ -135,5 +173,77 @@ function checkSpread(pn, ref) {
     return res;
 }
 
+function checkCrossPoolSpread(pairName, maxAgeMs = 3000) {
+    const pools = getPoolsForPair(pairName);
+    if (pools.length < 2) return null;
+
+    // Group fresh pools by dexType, keep best (highest liquidity) per DEX
+    const dexBest = new Map();
+    for (const p of pools) {
+        if (p.liquidity === 0n) continue; if (p.dexType === 'Meteora') continue;
+        const age = Date.now() - (p.lastUpdate || 0);
+        if (age > maxAgeMs) continue;
+        const px = getPoolPrice(p);
+        if (px <= 0) continue;
+
+        const existing = dexBest.get(p.dexType);
+        if (!existing || p.liquidity > existing.liquidity) {
+            dexBest.set(p.dexType, { address: p.address, dexType: p.dexType, price: px, liquidity: p.liquidity });
+        }
+    }
+
+    const reps = Array.from(dexBest.values());
+    if (reps.length < 2) return null;
+
+    let hi = reps[0], lo = reps[0];
+    for (let i = 1; i < reps.length; i++) {
+        if (reps[i].price > hi.price) hi = reps[i];
+        if (reps[i].price < lo.price) lo = reps[i];
+    }
+    const spread = (hi.price - lo.price) / lo.price;
+    return { spreadPct: spread, hiPool: hi, loPool: lo };
+}
+
+function localReSizeScan(pair, maxLamports, minProfitLamports) {
+    const MIN_LAM = 1_000_000_000n; // 1 SOL floor
+    const maxLam = BigInt(maxLamports);
+    const minProfit = BigInt(minProfitLamports);
+    const pools = getPoolsForPair(pair.name);
+    if (!pools || pools.length === 0) return null;
+
+    const steps = [1.0, 0.75, 0.5, 0.25];
+    for (const step of steps) {
+        const lam = BigInt(Math.floor(Number(maxLam) * step));
+        if (lam < MIN_LAM) continue;
+
+        // Best buy: SOL -> tokenB across all pools
+        let bestBuyOut = 0n;
+        for (const p of pools) {
+            const r = computeSwap(pair.tokenA, pair.tokenB, lam, p);
+            if (r && r.amountOut > bestBuyOut) bestBuyOut = r.amountOut;
+        }
+        if (bestBuyOut === 0n) continue;
+
+        // Best sell: tokenB -> SOL across all pools
+        let bestSellOut = 0n;
+        for (const p of pools) {
+            const r = computeSwap(pair.tokenB, pair.tokenA, bestBuyOut, p);
+            if (r && r.amountOut > bestSellOut) bestSellOut = r.amountOut;
+        }
+        if (bestSellOut === 0n) continue;
+
+        const profit = bestSellOut - lam;
+        if (profit >= minProfit) {
+            return {
+                amountIn: lam,
+                loanSizeSol: Number(lam) / 1e9,
+                estimatedProfit: profit,
+                spreadPct: Number(profit) / Number(lam),
+            };
+        }
+    }
+    return null;
+}
+
 module.exports = { registerPool, updatePoolState, decodePoolState, getPoolState, getPoolsForPair, getPoolPrice,
-    computeSwap, simulateSwap, checkSpread, _poolCache:poolCache, _poolRegistry:poolRegistry };
+    computeSwap, simulateSwap, checkSpread, checkCrossPoolSpread, localReSizeScan, _poolCache:poolCache, _poolRegistry:poolRegistry };

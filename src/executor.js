@@ -37,6 +37,9 @@ const JUPITER_SWAP_API  = 'https://lite-api.jup.ag/swap/v1';
 // Vote program ID — used to filter vote accounts from ALTs (Jito rejects bundles that lock vote accounts)
 const VOTE_PROGRAM_ID = 'Vote111111111111111111111111111111111111111';
 
+// Persistent cache: pubkey → true (vote) | false (not vote). Vote status is permanent — no TTL needed.
+const _voteAccountCache = new Map();
+
 // Jito tip accounts — one is picked per bundle submission
 // Source: https://jito-labs.gitbook.io/mev/searcher-resources/bundles
 const JITO_TIP_ACCOUNTS = [
@@ -58,6 +61,21 @@ const SOL_BANK_PK       = new PublicKey('CCKtUs6Cgwo4aaQUmBPmyoApH2gUDErxNZCAntD
 const FLASHLOAN_FEE_BPS = 0n;
 
 const DATA_DIR          = path.join(__dirname, '..', 'data');
+
+// -------------------------------------------------------
+//  KAMINO FLASHLOAN CONSTANTS
+// -------------------------------------------------------
+const KAMINO_PROGRAM_ID   = new PublicKey('KLend2g3cP87fffoy8q1mQqGKjrxjC8boSyAYavgmjD');
+const KAMINO_MARKET       = new PublicKey('7u3HeHxYDLhnCoErrtycNokbQYbWGzLs6JSDqGAv5PfF');
+const KAMINO_MARKET_AUTH  = new PublicKey('9DrvZvyWh1HuAoZxvYWMvkf2XCzryCpGgHqrMjyDWpmo');
+const KAMINO_SOL_RESERVE  = new PublicKey('d4A2prbA2whesmvHaL88BH6Ewn5N4bTSU2Ze8P6Bc4Q');
+const KAMINO_SOL_VAULT    = new PublicKey('GafNuUXj9rxGLn4y79dPu6MHSuPWeJR6UtTWuexpGh3U');
+const KAMINO_FEE_RECEIVER = new PublicKey('3JNof8s453bwG5UqiXBLJc77NRQXezYYEBbk3fqnoKph');
+const KAMINO_FLASH_BORROW_DISC = Buffer.from([135, 231, 52, 167, 7, 52, 212, 193]);
+const KAMINO_FLASH_REPAY_DISC  = Buffer.from([185, 117, 0, 203, 96, 245, 180, 186]);
+const SOL_MINT            = new PublicKey('So11111111111111111111111111111111111111112');
+const TOKEN_PROGRAM       = new PublicKey('TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA');
+const SYSVAR_INSTRUCTIONS = new PublicKey('Sysvar1nstructions1111111111111111111111111');
 const MFI_ACCOUNT_FILE  = path.join(DATA_DIR, 'marginfi_account.json');
 const LUT_CACHE_TTL_MS  = 30 * 60 * 1000; // LUTs are immutable on-chain — 30-min TTL is safe
 
@@ -156,7 +174,8 @@ class Executor {
             this.mfiAccount.makeBorrowIx(10, SOL_BANK_PK, this._mfiOpts),
             this.mfiAccount.makeRepayIx(10, SOL_BANK_PK, true, this._mfiOpts),
         ]);
-        this._borrowIxTemplate = borrowTemplate.instructions.map(ix => ({
+        // Remove CloseAccount (data[0]=9) from borrow — it destroys the WSOL ATA before Jupiter can use it
+        this._borrowIxTemplate = borrowTemplate.instructions.filter(ix => !(ix.data.length <= 4 && ix.data[0] === 9)).map(ix => ({
             programId: ix.programId, keys: ix.keys, data: Buffer.from(ix.data),
         }));
         this._repayIxTemplate = repayTemplate.instructions.map(ix => ({
@@ -164,6 +183,7 @@ class Executor {
         }));
         logger.info('[Executor] MFI instruction templates cached ✅');
 
+        await this._initKamino();
         this._startBlockhashCache();
     }
 
@@ -193,6 +213,84 @@ class Executor {
     //    lendingAccountRepay  data: [discriminator(8) | amount u64 LE(8) | repayAll(2)]
     //    SystemProgram.transfer   data: [type u32 LE(4) | amount+10000 u64 LE(8)]
     // -------------------------------------------------------
+
+    // -------------------------------------------------------
+    //  KAMINO FLASHLOAN — init (run once at startup)
+    // -------------------------------------------------------
+    async _initKamino() {
+        logger.info('[Executor] Initializing Kamino flashloan templates...');
+        const walletPk = this.wallet.publicKey;
+
+        // WSOL ATA for this wallet
+        const { getAssociatedTokenAddressSync } = require('@solana/spl-token');
+        const wsolAta = getAssociatedTokenAddressSync(SOL_MINT, walletPk);
+        this._kaminoWsolAta = wsolAta;
+
+        // Build borrow instruction data: discriminator(8) + liquidityAmount u64 LE(8)
+        const borrowData = Buffer.alloc(16);
+        KAMINO_FLASH_BORROW_DISC.copy(borrowData, 0);
+        borrowData.writeBigUInt64LE(1000000000n, 8); // placeholder 1 SOL
+
+        // Build repay instruction data: discriminator(8) + liquidityAmount u64 LE(8) + borrowInstructionIndex u8(1)
+        const repayData = Buffer.alloc(17);
+        KAMINO_FLASH_REPAY_DISC.copy(repayData, 0);
+        repayData.writeBigUInt64LE(1000010000n, 8); // placeholder 1 SOL + fee
+        repayData.writeUInt8(0, 16);                // borrowInstructionIndex — patched per trade
+
+        const borrowAccounts = [
+            { pubkey: walletPk,            isSigner: true,  isWritable: false }, // userTransferAuthority
+            { pubkey: KAMINO_MARKET_AUTH,  isSigner: false, isWritable: false }, // lendingMarketAuthority
+            { pubkey: KAMINO_MARKET,       isSigner: false, isWritable: false }, // lendingMarket
+            { pubkey: KAMINO_SOL_RESERVE,  isSigner: false, isWritable: true  }, // reserve
+            { pubkey: SOL_MINT,            isSigner: false, isWritable: false }, // reserveLiquidityMint
+            { pubkey: KAMINO_SOL_VAULT,    isSigner: false, isWritable: true  }, // reserveSourceLiquidity
+            { pubkey: wsolAta,             isSigner: false, isWritable: true  }, // userDestinationLiquidity
+            { pubkey: KAMINO_FEE_RECEIVER, isSigner: false, isWritable: true  }, // reserveLiquidityFeeReceiver
+            { pubkey: KAMINO_PROGRAM_ID, isSigner: false, isWritable: false }, // referrerTokenState (None)
+            { pubkey: KAMINO_PROGRAM_ID, isSigner: false, isWritable: false }, // referrerAccount (None)
+            { pubkey: SYSVAR_INSTRUCTIONS, isSigner: false, isWritable: false }, // sysvarInfo
+            { pubkey: TOKEN_PROGRAM,       isSigner: false, isWritable: false }, // tokenProgram
+        ];
+
+        const repayAccounts = [
+            { pubkey: walletPk,            isSigner: true,  isWritable: false }, // userTransferAuthority
+            { pubkey: KAMINO_MARKET_AUTH,  isSigner: false, isWritable: false }, // lendingMarketAuthority
+            { pubkey: KAMINO_MARKET,       isSigner: false, isWritable: false }, // lendingMarket
+            { pubkey: KAMINO_SOL_RESERVE,  isSigner: false, isWritable: true  }, // reserve
+            { pubkey: SOL_MINT,            isSigner: false, isWritable: false }, // reserveLiquidityMint
+            { pubkey: KAMINO_SOL_VAULT,    isSigner: false, isWritable: true  }, // reserveDestinationLiquidity
+            { pubkey: wsolAta,             isSigner: false, isWritable: true  }, // userSourceLiquidity
+            { pubkey: KAMINO_FEE_RECEIVER, isSigner: false, isWritable: true  }, // reserveLiquidityFeeReceiver
+            { pubkey: KAMINO_PROGRAM_ID, isSigner: false, isWritable: false }, // referrerTokenState (None)
+            { pubkey: KAMINO_PROGRAM_ID, isSigner: false, isWritable: false }, // referrerAccount (None)
+            { pubkey: SYSVAR_INSTRUCTIONS, isSigner: false, isWritable: false }, // sysvarInfo
+            { pubkey: TOKEN_PROGRAM,       isSigner: false, isWritable: false }, // tokenProgram
+        ];
+
+        this._kaminoBorrowTemplate = [{ programId: KAMINO_PROGRAM_ID, keys: borrowAccounts, data: borrowData }];
+        this._kaminoRepayTemplate  = [{ programId: KAMINO_PROGRAM_ID, keys: repayAccounts,  data: repayData  }];
+        logger.info(`[Executor] Kamino flashloan templates cached ✅ (wsolAta: ${wsolAta.toBase58().slice(0,8)}...)`);
+    }
+
+    // -------------------------------------------------------
+    //  KAMINO FLASHLOAN — build ixs per trade (pure CPU)
+    // -------------------------------------------------------
+    _buildKaminoIxs(amountLamports, borrowIxIndex) {
+        const amt = BigInt(amountLamports);
+
+        const borrowData = Buffer.from(this._kaminoBorrowTemplate[0].data);
+        borrowData.writeBigUInt64LE(amt, 8);
+
+        const repayData = Buffer.from(this._kaminoRepayTemplate[0].data);
+        repayData.writeBigUInt64LE(amt, 8);
+        repayData.writeUInt8(borrowIxIndex, 16); // index of borrow ix in the transaction
+
+        return [
+            { instructions: [new TransactionInstruction({ programId: KAMINO_PROGRAM_ID, keys: this._kaminoBorrowTemplate[0].keys, data: borrowData })] },
+            { instructions: [new TransactionInstruction({ programId: KAMINO_PROGRAM_ID, keys: this._kaminoRepayTemplate[0].keys, data: repayData  })] },
+        ];
+    }
+
     _buildMfiIxs(amountLamports) {
         const amt = BigInt(amountLamports);
 
@@ -205,7 +303,7 @@ class Executor {
                 data.writeBigUInt64LE(amt, 8); // repayAll 0x0101 at [16] stays baked in
             } else if (data.length === 12 && data.readUInt32LE(0) === 2) {
                 // SystemProgram.Transfer (wrap SOL before repay): amount + 10000 extra lamports
-                data.writeBigUInt64LE(100000n, 4);
+                data.writeBigUInt64LE(amt + 10000n, 4);
             }
 
             return new TransactionInstruction({ programId: ix.programId, keys: ix.keys, data });
@@ -296,7 +394,7 @@ class Executor {
     //  prioritizationFeeLamports omitted — Jito tip handles ordering,
     //  and including it adds a SetComputeUnitPrice ix that wastes tx bytes.
     // -------------------------------------------------------
-    async _getSwapInstructions(quoteResponse, slippageOverride = null) {
+    async _getSwapInstructions(quoteResponse, slippageOverride = null, useTokenLedger = false) {
         const slippageBps = slippageOverride !== null
             ? slippageOverride
             : parseInt(process.env.SLIPPAGE_BPS || this.config.SLIPPAGE_BPS || '50');
@@ -307,7 +405,9 @@ class Executor {
             wrapAndUnwrapSol:        false,
             dynamicComputeUnitLimit: true,
             slippageBps,
+            ...(useTokenLedger ? { useTokenLedger: true } : {}),
         };
+        
         const res = await axios.post(`${JUPITER_SWAP_API}/swap-instructions`, params, { timeout: 6000 });
         return res.data;
     }
@@ -440,9 +540,15 @@ class Executor {
     // -------------------------------------------------------
     async execute(opportunity) {
         const { grossProfit, bestBuyQuote, reverseQuote, pair, amountIn } = opportunity;
+        logger.info(`[Executor] Buy quote slippage: ${bestBuyQuote.slippageBps} | otherAmountThreshold: ${bestBuyQuote.otherAmountThreshold}`);
+        logger.info(`[Executor] Sell quote slippage: ${reverseQuote.slippageBps} | otherAmountThreshold: ${reverseQuote.otherAmountThreshold}`);
+        const buyRoute = (bestBuyQuote.routePlan || []).map(r => r.swapInfo?.label || 'unknown').join(' → ');
+        const sellRoute = (reverseQuote.routePlan || []).map(r => r.swapInfo?.label || 'unknown').join(' → ');
+        logger.info(`[Executor] Routes — Buy: ${buyRoute} | Sell: ${sellRoute}`);
+        logger.info(`[Executor] Buy: ${bestBuyQuote.inAmount} → ${bestBuyQuote.outAmount} (${bestBuyQuote.inputMint.slice(0,8)}→${bestBuyQuote.outputMint.slice(0,8)}) | Sell: ${reverseQuote.inAmount} → ${reverseQuote.outAmount} (${reverseQuote.inputMint.slice(0,8)}→${reverseQuote.outputMint.slice(0,8)})`);
 
-        if (!this.mfiAccount) {
-            logger.error('[Executor] MarginFi account not initialized — call init() first');
+        if (!this._kaminoBorrowTemplate) {
+            logger.error('[Executor] Kamino flashloan not initialized — call init() first');
             return false;
         }
 
@@ -472,7 +578,7 @@ class Executor {
         try {
             // ── Step 1: MFI ixs (CPU — cached templates, no RPC) ─────────
             const amountLamports = Math.round(Number(amountIn));
-            const [borrowWrapper, repayWrapper] = this._buildMfiIxs(amountLamports);
+            const [borrowWrapper, repayWrapper] = this._buildKaminoIxs(amountLamports, 2); // borrowIxIndex=1: jitoTip is ix[0], borrow is ix[1]
 
             // ── Steps 2+blockhash [PARALLEL] ────────────────────────────
             //  Blockhash is served from in-memory cache (refreshed every 500ms)
@@ -480,17 +586,104 @@ class Executor {
             const { blockhash, lastValidBlockHeight } =
                 this._blockhashCache || await this.connection.getLatestBlockhash('processed');
 
+            // Proportionally scale sell quote to match buy's guaranteed minimum output.
+            // Patching only inAmount left outAmount/otherAmountThreshold inconsistent > 6001.
+            {
+                const origSellIn = BigInt(reverseQuote.inAmount);
+                // Use 25bps buffer instead of full 100bps otherAmountThreshold
+                const buyOut = BigInt(bestBuyQuote.outAmount);
+                const buyThreshold = BigInt(bestBuyQuote.otherAmountThreshold);
+                const adjSellIn = buyOut - (buyOut - buyThreshold) * 10n / 100n;
+                if (origSellIn > 0n && adjSellIn < origSellIn) {
+                    const scaledOut       = BigInt(reverseQuote.outAmount) * adjSellIn / origSellIn;
+                    const scaledThreshold = BigInt(reverseQuote.otherAmountThreshold) * adjSellIn / origSellIn;
+                    logger.info('[Executor] Sell quote scaling: inAmount ' + origSellIn + ' > ' + adjSellIn +
+                        ' | outAmount ' + reverseQuote.outAmount + ' > ' + scaledOut +
+                        ' | threshold ' + reverseQuote.otherAmountThreshold + ' > ' + scaledThreshold +
+                        ' | ratio: ' + (Number(adjSellIn) * 100 / Number(origSellIn)).toFixed(2) + '%');
+                    reverseQuote.inAmount = String(adjSellIn);
+                    reverseQuote.outAmount = String(scaledOut);
+                    reverseQuote.otherAmountThreshold = String(scaledThreshold);
+                    // Scale routePlan swapInfo amounts — Jupiter builds instructions from these, not top-level fields
+                    if (reverseQuote.routePlan) {
+                        for (const step of reverseQuote.routePlan) {
+                            if (step.swapInfo) {
+                                const origIn = BigInt(step.swapInfo.inAmount);
+                                const origOut = BigInt(step.swapInfo.outAmount);
+                                step.swapInfo.inAmount = String(origIn * adjSellIn / origSellIn);
+                                step.swapInfo.outAmount = String(origOut * adjSellIn / origSellIn);
+                            }
+                        }
+                    }
+                } else {
+                    logger.info('[Executor] Sell quote scaling: no adjustment needed (adjIn >= origIn)');
+                }
+            }
+
+            // Post-scaling profitability recheck: original grossProfit used unscaled quotes.
+            // After scaling sell to buy's otherAmountThreshold, sell output drops.
+            // Reject if trade is no longer profitable to avoid Custom:1 on repay.
+            {
+                const scaledSellOut = BigInt(reverseQuote.outAmount);
+                const borrowAmt = BigInt(amountIn);
+                const scaledGross = scaledSellOut - borrowAmt;
+                if (scaledGross <= 0n) {
+                    const scaledUsd = (Number(scaledGross) / 1e9 * getSolPrice()).toFixed(4);
+                    logger.info('[Executor] Post-scaling: net negative (' + scaledUsd + ' USD) — aborting');
+                    return false;
+                }
+                if (!await this.isProfitable(scaledGross, borrowAmt)) {
+                    const scaledUsd = (Number(scaledGross) / 1e9 * getSolPrice()).toFixed(4);
+                    logger.info('[Executor] Post-scaling: below min profit (' + scaledUsd + ' USD) — aborting');
+                    return false;
+                }
+                logger.info('[Executor] Post-scaling profit OK: ' + (Number(scaledGross) / 1e9 * getSolPrice()).toFixed(4) + ' USD');
+            }
+
             const [buyIxData, sellIxData] = await Promise.all([
                 this._getSwapInstructions(bestBuyQuote),
-                this._getSwapInstructions(reverseQuote, 0),
+                this._getSwapInstructions(reverseQuote, 150),
             ]);
+
+            // Pre-flight vote check REMOVED — Jito-native DEXes need vote accounts as readonly inputs
 
             // ── Step 3: Collect address lookup tables ─────────────────
             const lutAddresses = [
                 ...(buyIxData.addressLookupTableAddresses  || []),
                 ...(sellIxData.addressLookupTableAddresses || []),
             ];
-            const lookupTables = await this._loadLookupTables([...new Set(lutAddresses)]);
+            const rawLookupTables = await this._loadLookupTables([...new Set(lutAddresses)]);
+            // Filter ALL vote accounts from ALT address lists — Jito rejects ANY vote account
+            const lookupTables = [];
+            for (const alt of rawLookupTables) {
+                const voteAddrs = [];
+                const uncached = alt.state.addresses.filter(a => !_voteAccountCache.has(a.toString()));
+                if (uncached.length > 0) {
+                    try {
+                        const infos = await this.connection.getMultipleAccountsInfo(uncached);
+                        for (let i = 0; i < uncached.length; i++) {
+                            const isVote = infos[i] && infos[i].owner.toString() === VOTE_PROGRAM_ID ? true : false;
+                            _voteAccountCache.set(uncached[i].toString(), isVote);
+                        }
+                    } catch (e) { uncached.forEach(a => _voteAccountCache.set(a.toString(), false)); }
+                }
+                for (const addr of alt.state.addresses) {
+                    if (_voteAccountCache.get(addr.toString())) voteAddrs.push(addr.toString());
+                }
+                if (voteAddrs.length > 0) {
+                    logger.info('[Executor] Found ' + voteAddrs.length + ' vote account(s) in ALT: ' + alt.key.toString().slice(0,12) + ' — marking readonly in instructions');
+                    // Mark vote accounts as readonly in all innerIxs
+                    for (const ix of innerIxs) {
+                        for (const key of ix.keys) {
+                            if (voteAddrs.includes(key.pubkey.toString()) && key.isWritable) {
+                                key.isWritable = false;
+                                logger.debug('[Executor] Downgraded vote account to readonly: ' + key.pubkey.toString().slice(0,12));
+                            }
+                        }
+                    }
+                }
+                lookupTables.push(alt);
+            }
 
             // ── Step 4: Build ordered instruction list ─────────────────
             //  Layout inside flashloan wrapper:
@@ -535,20 +728,59 @@ class Executor {
                 lamports:   jitoTipLamports,
             });
 
+            // Create WSOL ATA idempotently before flash borrow
+            const { createAssociatedTokenAccountIdempotentInstruction } = require('@solana/spl-token');
+            const wsolAtaCreateIx = createAssociatedTokenAccountIdempotentInstruction(
+                this.wallet.publicKey,  // payer
+                this._kaminoWsolAta,    // ata
+                this.wallet.publicKey,  // owner
+                SOL_MINT                // mint
+            );
             const innerIxs = [
                 jitoTipIx,
+                wsolAtaCreateIx,
                 ...(borrowWrapper.instructions || []),
                 ...computeBudgetIxs,
                 ...buySetupIxs,
-                ...(buyIxData.tokenLedgerInstruction ? [this._deserializeIx(buyIxData.tokenLedgerInstruction)] : []),
+                // buy tokenLedger removed — buy uses fixed inAmount, only sell needs ledger
                 this._deserializeIx(buyIxData.swapInstruction),
                 ...(buyIxData.cleanupInstruction  ? [this._deserializeIx(buyIxData.cleanupInstruction)] : []),
                 ...sellSetupIxs,
-                ...(sellIxData.tokenLedgerInstruction ? [this._deserializeIx(sellIxData.tokenLedgerInstruction)] : []),
+                // sellTokenLedger removed
                 this._deserializeIx(sellIxData.swapInstruction),
                 ...(sellIxData.cleanupInstruction ? [this._deserializeIx(sellIxData.cleanupInstruction)] : []),
                 ...(repayWrapper.instructions || []),
+                // Fix C: Unwrap WSOL -> native SOL after repay (profit sits in WSOL ATA)
+                (() => {
+                    const { createCloseAccountInstruction, NATIVE_MINT } = require('@solana/spl-token');
+                    const { getAssociatedTokenAddressSync } = require('@solana/spl-token');
+                    const wsolAta = getAssociatedTokenAddressSync(NATIVE_MINT, this.wallet.publicKey);
+                    return createCloseAccountInstruction(wsolAta, this.wallet.publicKey, this.wallet.publicKey);
+                })(),
             ];
+
+            // ── Dynamic borrowIxIndex: find actual borrow position in innerIxs ──
+            // Hardcoded index=2 breaks when Jupiter setup ixs shift the borrow position.
+            // Kamino repay validates borrowInstructionIndex via Sysvar Instructions —
+            // if it doesn't point to the actual borrow ix, repay fails with Custom:1.
+            {
+                const KAMINO_PID = KAMINO_PROGRAM_ID.toBase58();
+                const borrowDiscHex = KAMINO_FLASH_BORROW_DISC.toString('hex');
+                let foundIdx = -1;
+                for (let i = 0; i < innerIxs.length; i++) {
+                    const ix = innerIxs[i];
+                    if (ix.programId.toBase58() === KAMINO_PID && ix.data.subarray(0, 8).toString('hex') === borrowDiscHex) {
+                        foundIdx = i;
+                        break;
+                    }
+                }
+                if (foundIdx === -1) throw new Error('Kamino borrow instruction not found in innerIxs');
+                // Patch the repay instruction's borrowInstructionIndex byte
+                const repayIx = innerIxs.find(ix => ix.programId.toBase58() === KAMINO_PID && ix.data.subarray(0, 8).toString('hex') === KAMINO_FLASH_REPAY_DISC.toString('hex'));
+                if (!repayIx) throw new Error('Kamino repay instruction not found in innerIxs');
+                repayIx.data.writeUInt8(foundIdx, 16);
+                logger.info('[Executor] borrowIxIndex dynamically set to ' + foundIdx + ' (was hardcoded 2)');
+            }
 
             // ── Step 5: Build flashloan tx (MarginFi adds begin/end) ──
             // blockhash already fetched in parallel with steps 1+2 above
@@ -557,18 +789,24 @@ class Executor {
             const freshBh = await this.connection.getLatestBlockhash('processed');
             const finalBlockhash = freshBh.blockhash;
             const finalLastValidBlockHeight = freshBh.lastValidBlockHeight;
-            const flashTx = await this.mfiAccount.buildFlashLoanTx({
-                ixs:                        innerIxs,
-                addressLookupTableAccounts: lookupTables,
-                blockhash:           finalBlockhash,
-            });
+            const { TransactionMessage, VersionedTransaction } = require('@solana/web3.js');
+            let flashTx = (() => {
+                const msg = new TransactionMessage({
+                    payerKey:           this.wallet.publicKey,
+                    recentBlockhash:    finalBlockhash,
+                    instructions:       innerIxs,
+                }).compileToV0Message(lookupTables);
+                return new VersionedTransaction(msg);
+            })();
 
-            // ── Step 6: Sign ──────────────────────────────────────────
-            flashTx.sign([this.wallet]);
-
-            // ── Step 6b: Vote account diagnostic ──────────────────────
-            // Jito rejects bundles that reference ANY vote account — even
-            // read-only ALT entries. Check ALL accounts in the tx.
+            // ── Step 5b: Vote account filter ──────────────────────────
+            // Jito rejects bundles that lock ANY vote-program-owned account
+            // as writable. Vote accounts sneak in via Jupiter's ALT writable
+            // indexes — invisible to instruction key arrays.
+            // Fix: detect vote accounts in compiled tx, patch innerIxs to mark
+            // them readonly, rebuild tx. buildFlashLoanTx recompiles the message
+            // from innerIxs, so patched isWritable flags propagate into ALT
+            // writable/readonly index assignment.
             try {
                 const msg = flashTx.message;
                 const numSigners    = msg.header.numRequiredSignatures;
@@ -579,90 +817,174 @@ class Executor {
                 const writableSignerCount    = numSigners - numReadonlyS;
                 const readonlyUnsignedStart  = totalStatic - numReadonlyU;
 
+                // Collect all writable keys (static + ALT writable indexes)
                 const writableKeys = [];
-                const readonlyKeys = [];
                 for (let i = 0; i < totalStatic; i++) {
                     const isReadonlySigner   = (i >= writableSignerCount && i < numSigners);
                     const isReadonlyUnsigned = (i >= readonlyUnsignedStart);
                     if (!isReadonlySigner && !isReadonlyUnsigned) {
                         writableKeys.push(staticKeys[i]);
-                    } else {
-                        readonlyKeys.push(staticKeys[i]);
                     }
                 }
-
-                // Collect ALL accounts from ALT lookups (writable + readonly)
-                const altWritableKeys = [];
-                const altReadonlyKeys = [];
                 if (msg.addressTableLookups) {
                     for (const lookup of msg.addressTableLookups) {
                         const table = lookupTables.find(t => t.key.equals(lookup.accountKey));
                         if (!table) continue;
-                        const altAddr = lookup.accountKey.toString();
                         for (const idx of (lookup.writableIndexes || [])) {
                             const addr = table.state.addresses[idx];
-                            if (addr) {
-                                writableKeys.push(addr.toString());
-                                altWritableKeys.push({ addr: addr.toString(), alt: altAddr.slice(0, 12), idx });
-                            }
-                        }
-                        for (const idx of (lookup.readonlyIndexes || [])) {
-                            const addr = table.state.addresses[idx];
-                            if (addr) {
-                                readonlyKeys.push(addr.toString());
-                                altReadonlyKeys.push({ addr: addr.toString(), alt: altAddr.slice(0, 12), idx });
-                            }
+                            if (addr) writableKeys.push(addr.toString());
                         }
                     }
                 }
 
-                const allKeys = [...new Set([...writableKeys, ...readonlyKeys])];
-                const altAddrs = (msg.addressTableLookups || []).map(l => l.accountKey.toString());
-                logger.info(`[Executor] Tx accounts: ${writableKeys.length} writable + ${readonlyKeys.length} readonly = ${allKeys.length} unique | ${altAddrs.length} ALTs`);
-                if (altAddrs.length > 0) {
-                    logger.debug(`[Executor] ALT addresses: ${altAddrs.join(', ')}`);
+                // Only look up keys not already in cache
+                const uncachedKeys = writableKeys.filter(k => !_voteAccountCache.has(k));
+                if (uncachedKeys.length > 0 && uncachedKeys.length <= 100) {
+                    const infos = await this.connection.getMultipleAccountsInfo(
+                        uncachedKeys.map(k => new PublicKey(k)),
+                        { commitment: 'confirmed' }
+                    );
+                    for (let i = 0; i < infos.length; i++) {
+                        _voteAccountCache.set(uncachedKeys[i], !!(infos[i] && infos[i].owner.toString() === VOTE_PROGRAM_ID));
+                    }
+                    logger.debug(`[Executor] Vote cache: +${uncachedKeys.length} lookups, ${_voteAccountCache.size} total`);
+                } else if (uncachedKeys.length > 100) {
+                    // Batch in groups of 100
+                    for (let b = 0; b < uncachedKeys.length; b += 100) {
+                        const batch = uncachedKeys.slice(b, b + 100);
+                        const infos = await this.connection.getMultipleAccountsInfo(
+                            batch.map(k => new PublicKey(k)),
+                            { commitment: 'confirmed' }
+                        );
+                        for (let i = 0; i < infos.length; i++) {
+                            _voteAccountCache.set(batch[i], !!(infos[i] && infos[i].owner.toString() === VOTE_PROGRAM_ID));
+                        }
+                    }
+                    logger.debug(`[Executor] Vote cache: +${uncachedKeys.length} lookups (batched), ${_voteAccountCache.size} total`);
                 }
 
-                // On-chain check: fetch owners of ALL accounts to find vote accounts
-                if (allKeys.length > 0 && allKeys.length <= 200) {
-                    try {
-                        // Batch in groups of 100
-                        const voteAccounts = [];
-                        for (let b = 0; b < allKeys.length; b += 100) {
-                            const batch = allKeys.slice(b, b + 100);
-                            const infos = await this.connection.getMultipleAccountsInfo(
-                                batch.map(k => new PublicKey(k)),
-                                { commitment: 'confirmed' }
-                            );
-                            for (let i = 0; i < infos.length; i++) {
-                                if (infos[i] && infos[i].owner.toString() === VOTE_PROGRAM_ID) {
-                                    const key = batch[i];
-                                    const isWritable = writableKeys.includes(key);
-                                    const altEntry = [...altWritableKeys, ...altReadonlyKeys].find(e => e.addr === key);
-                                    const source = altEntry
-                                        ? `ALT ${altEntry.alt}... idx=${altEntry.idx} (${isWritable ? 'WRITABLE' : 'READONLY'})`
-                                        : `static (${isWritable ? 'WRITABLE' : 'READONLY'})`;
-                                    voteAccounts.push({ key, source });
-                                }
+                // Identify vote accounts among writable keys
+                const voteSet = new Set();
+                for (const k of writableKeys) {
+                    if (_voteAccountCache.get(k) === true) voteSet.add(k);
+                }
+
+                if (voteSet.size > 0) {
+                    logger.warn(`[Executor] ⚠️  Filtering ${voteSet.size} vote account(s) from writable set: ${[...voteSet].join(', ')}`);
+
+                    // Patch innerIxs: mark vote accounts as readonly
+                    let patchCount = 0;
+                    for (const ix of innerIxs) {
+                        for (const key of (ix.keys || [])) {
+                            if (key.isWritable && voteSet.has(key.pubkey.toString())) {
+                                key.isWritable = false;
+                                patchCount++;
                             }
                         }
-                        if (voteAccounts.length > 0) {
-                            for (const va of voteAccounts) {
-                                logger.warn(`[Executor] ⚠️  VOTE ACCOUNT: ${va.key} | Source: ${va.source}`);
-                            }
-                            logger.warn(`[Executor] ${voteAccounts.length} vote account(s) found — Jito will reject. Pair: ${pair.name}`);
-                        } else {
-                            logger.info(`[Executor] ✅ No vote accounts in tx (${allKeys.length} checked)`);
-                        }
-                    } catch (voteCheckErr) {
-                        logger.debug(`[Executor] Vote account on-chain check failed: ${voteCheckErr.message}`);
                     }
+
+                    // Rebuild tx — buildFlashLoanTx recompiles the versioned message
+                    // from innerIxs. Patched isWritable=false means the vote account
+                    // lands in ALT readonlyIndexes instead of writableIndexes.
+                    flashTx = (() => {
+                        const msg = new TransactionMessage({
+                            payerKey:           this.wallet.publicKey,
+                            recentBlockhash:    finalBlockhash,
+                            instructions:       innerIxs,
+                        }).compileToV0Message(lookupTables);
+                        return new VersionedTransaction(msg);
+                    })();
+                    logger.info(`[Executor] ✅ Tx rebuilt — ${voteSet.size} vote account(s) → readonly (${patchCount} ix keys patched)`);
                 } else {
-                    logger.debug(`[Executor] Skipping vote check — ${allKeys.length} accounts (outside 1-200 range)`);
+                    logger.debug(`[Executor] No vote accounts in ${writableKeys.length} writable keys (${uncachedKeys.length} new lookups)`);
                 }
-            } catch (diagErr) {
-                logger.debug(`[Executor] Vote diagnostic error: ${diagErr.message}`);
+            } catch (voteFixErr) {
+                logger.warn(`[Executor] Vote filter error (proceeding with original tx): ${voteFixErr.message}`);
             }
+
+            // ── Diagnostic: check vote account status in final compiled message ──
+            const JITO_VOTE_DIAG = 'J1to1yufRnoWn81KYg1XkTWzmKjnYSnmE2VY8DGUJ9Qv';
+            // Check ALL accounts in compiled tx for vote program ownership
+            const allTxAccounts = [];
+            const fMsgCheck = flashTx.message;
+            const fStaticAll = fMsgCheck.staticAccountKeys.map(k => k.toString());
+            fStaticAll.forEach((k, i) => allTxAccounts.push({ addr: k, source: 'static', idx: i }));
+            for (const lookup of (fMsgCheck.addressTableLookups || [])) {
+                const altAddr = lookup.accountKey.toString();
+                const altObj = lookupTables.find(t => t.key.toString() === altAddr);
+                if (!altObj) continue;
+                for (const wi of lookup.writableIndexes) {
+                    const a = altObj.state.addresses[wi];
+                    if (a) allTxAccounts.push({ addr: a.toString(), source: 'ALT-W', idx: wi, alt: altAddr.slice(0,12) });
+                }
+                for (const ri of lookup.readonlyIndexes) {
+                    const a = altObj.state.addresses[ri];
+                    if (a) allTxAccounts.push({ addr: a.toString(), source: 'ALT-R', idx: ri, alt: altAddr.slice(0,12) });
+                }
+            }
+            const voteAccounts = allTxAccounts.filter(a => _voteAccountCache.get(a.addr));
+            if (voteAccounts.length > 0) {
+                for (const v of voteAccounts) {
+                    logger.warn('[Executor] VOTE IN TX: ' + v.addr.slice(0,12) + ' source=' + v.source + (v.alt ? ' ALT=' + v.alt : '') + ' idx=' + v.idx);
+                }
+            } else {
+                logger.info('[Executor] No vote accounts found in final compiled tx (' + allTxAccounts.length + ' accounts checked)');
+            }
+            const fMsg = flashTx.message;
+            const fStatic = fMsg.staticAccountKeys.map(k => k.toString());
+            const fNumSigners = fMsg.header.numRequiredSignatures;
+            const fNumRoSigned = fMsg.header.numReadonlySignedAccounts;
+            const fNumRoUnsigned = fMsg.header.numReadonlyUnsignedAccounts;
+            const fWritableEnd = fStatic.length - fNumRoUnsigned;
+            const fWritableStatic = fStatic.slice(0, fWritableEnd);
+            const voteInStatic = fStatic.indexOf(JITO_VOTE_DIAG);
+            if (voteInStatic >= 0) {
+                const isW = voteInStatic < fWritableEnd;
+                logger.info('[Executor] VOTE DIAG: ' + JITO_VOTE_DIAG.slice(0,12) + ' in STATIC keys, index=' + voteInStatic + ', writable=' + isW);
+            }
+            // Check ALT indexes
+            for (const lookup of (fMsgCheck.addressTableLookups || [])) {
+                const altKey = lookup.accountKey.toString().slice(0,12);
+                const wIdx = lookup.writableIndexes || [];
+                const rIdx = lookup.readonlyIndexes || [];
+                logger.info('[Executor] ALT ' + altKey + ': writableIdx=[' + wIdx.join(',') + '] readonlyIdx=[' + rIdx.join(',') + ']');
+            }
+            // ── Step 5c: Patch vote accounts from writable to readonly in ALT lookups ──
+            // Jito checks raw ALT indexes, not instruction flags. buildFlashLoanTx may place
+            // vote accounts in writableIndexes even if we patched isWritable=false in innerIxs.
+            // Patch ALL vote accounts in ALT writable indexes to readonly
+            const msg2 = flashTx.message;
+            let needsRebuild = false;
+            for (const lookup of (msg2.addressTableLookups || [])) {
+                const altAddr = lookup.accountKey.toString();
+                const altObj = lookupTables.find(t => t.key.toString() === altAddr);
+                if (!altObj) continue;
+                const addrs = altObj.state.addresses.map(a => a.toString());
+                const patchedWritable = [];
+                const patchedReadonly = [...lookup.readonlyIndexes];
+                for (const wIdx of lookup.writableIndexes) {
+                    const addr = addrs[wIdx];
+                    if (addr && _voteAccountCache.get(addr)) {
+                        patchedReadonly.push(wIdx);
+                        needsRebuild = true;
+                        logger.info('[Executor] Moved vote account ' + addr.slice(0,12) + ' from writable to readonly in ALT ' + altAddr.slice(0,12) + ' idx=' + wIdx);
+                    } else {
+                        patchedWritable.push(wIdx);
+                    }
+                }
+                lookup.writableIndexes = patchedWritable;
+                lookup.readonlyIndexes = patchedReadonly;
+            }
+            if (needsRebuild) {
+                const { TransactionMessage, VersionedTransaction } = require('@solana/web3.js');
+                const decompiled = TransactionMessage.decompile(msg2, { addressLookupTableAccounts: lookupTables });
+                const recompiledMsg = decompiled.compileToV0Message(lookupTables);
+                flashTx = new VersionedTransaction(recompiledMsg);
+                logger.info('[Executor] Transaction rebuilt — all vote accounts moved to readonly');
+            }
+            
+            // ── Step 6: Sign ──────────────────────────────────────────
+            flashTx.sign([this.wallet]);
 
             // Guard: Solana versioned transactions are capped at 1232 bytes.
             // Serialize once after signing — used for both size check and Jito submission.
@@ -678,82 +1000,47 @@ class Executor {
                 throw new Error(`Transaction too large: ${serializedBuf.length} bytes (limit 1232). Reduce JUPITER_MAX_ACCOUNTS.`);
             }
             logger.debug(`[Executor] Tx size: ${serializedBuf.length} bytes`);
-            // ── Step 6c: Simulate before submission (~50ms) ─────────────
-            // Catches bad trades instantly instead of wasting 30s on confirmation timeout.
-            try {
-                const simResult = await this.connection.simulateTransaction(flashTx, {
-                    replaceRecentBlockhash: false,
-                    sigVerify: false,
-                });
-                if (simResult.value.err) {
-                    const errStr = JSON.stringify(simResult.value.err);
-                    logger.warn(`[Executor] Simulation FAILED — skipping submission: ${errStr}`);
-                    const logs = (simResult.value.logs || []).slice(-5).join(' | ');
-                    logger.debug(`[Executor] Sim logs (last 5): ${logs}`);
-                    this.stats.txFailed++;
-                    return { success: false, reason: `sim-failed: ${errStr}` };
-                }
-                logger.debug(`[Executor] Simulation OK — CU used: ${simResult.value.unitsConsumed}`);
-            } catch (simErr) {
-                // RPC sim call itself failed (network issue) — proceed with submission anyway
-                logger.warn(`[Executor] Simulation RPC error (proceeding): ${simErr.message}`);
-            }
+            // ── Step 6c: Simulation DISABLED — flashloan context causes false negatives
 
             // ── Step 7: Submit via Jito + direct RPC simultaneously ──────
             // Both fire with the same signed tx — on-chain it's idempotent (same sig).
             // Eliminates the old 3s Jito-wait before fallback. No re-sign needed.
             const serialized  = bs58.encode(serializedBuf);
-            const jitoP       = this._submitJitoBundle([serialized]);
-            const directP     = this.connection.sendRawTransaction(serializedBuf, {
-                skipPreflight: true,
-                maxRetries:    parseInt(process.env.MAX_RETRIES || '3'),
-            }).catch(e => { logger.debug(`[Executor] Direct send error: ${e.message}`); return null; });
-
-            const [bundleId, directSig] = await Promise.all([jitoP, directP]);
+            // Bundle submission replaced by sendTransaction above
+            const bundleId = null;
+            // Submit via Jito sendTransaction (MEV-protected, no vote account restriction)
+            const jitoTxEndpoints = [
+                'https://mainnet.block-engine.jito.wtf/api/v1/transactions',
+                'https://frankfurt.mainnet.block-engine.jito.wtf/api/v1/transactions',
+                'https://amsterdam.mainnet.block-engine.jito.wtf/api/v1/transactions',
+            ];
+            let directSig = null;
+            try {
+                directSig = await Promise.any(jitoTxEndpoints.map(endpoint =>
+                    axios.post(endpoint, {
+                        jsonrpc: '2.0', id: 1,
+                        method: 'sendTransaction',
+                        params: [serialized, { encoding: 'base58' }],
+                    }, {
+                        headers: { 'Content-Type': 'application/json' },
+                        timeout: 5000,
+                    }).then(resp => {
+                        if (!resp.data?.result) throw new Error('no result');
+                        logger.info('[Executor] Jito sendTransaction accepted via ' + endpoint.split('/')[2].split('.')[0]);
+                        return resp.data.result;
+                    })
+                ));
+            } catch {
+                directSig = bs58.encode(flashTx.signatures[0]);
+                logger.warn('[Executor] All Jito TX endpoints failed — using signature from signed tx');
+            }
             this.stats.txSent++;
 
-            // Always confirm on-chain via directSig — a Jito bundleId only means the bundle
-            // was accepted by the block engine, NOT that it landed on-chain. The same signed
-            // tx is sent via both paths so directSig confirms whichever path landed it.
+            // Fire-and-forget confirmation — don't block the hot path
             if (directSig) {
-                if (!bundleId) {
-                    discord.alertJitoFallback(pair.name).catch(() => {});
-                }
-                logger.info(`[Executor] Confirming tx on-chain: ${directSig}${bundleId ? ` (Jito bundle: ${bundleId})` : ''}`);
-                try {
-                    const confirmTimeout = new Promise((_, reject) =>
-                        setTimeout(() => reject(new Error('Confirmation timeout after 30s')), 30000)
-                    );
-                    const result = await Promise.race([
-                        this.connection.confirmTransaction(
-                            { signature: directSig, blockhash: finalBlockhash, lastValidBlockHeight: finalLastValidBlockHeight },
-                            { commitment: 'confirmed', disableRetryOnRateLimit: true }
-                        ),
-                        confirmTimeout,
-                    ]);
-                    if (result.value.err) {
-                        const reason = JSON.stringify(result.value.err);
-                        logger.error(`[Executor] Tx failed on-chain: ${reason}`);
-                        discord.alertTxFailed(pair.name, reason).catch(() => {});
-                        return false;
-                    }
-                    this.stats.txSuccess++;
-                    this.stats.totalProfit += grossProfit;
-                    logger.info(`✅ FLASHLOAN confirmed | Profit: ~$${profitUsd} | Sig: ${directSig}${bundleId ? ` | Bundle: ${bundleId}` : ''}`);
-                    discord.alertTrade(profitUsd, pair.name, directSig).catch(() => {});
-                    return true;
-                } catch (confirmErr) {
-                    logger.error(`[Executor] Tx confirmation failed: ${confirmErr.message}`);
-                    discord.alertTxFailed(pair.name, confirmErr.message).catch(() => {});
-                    return false;
-                }
-            }
-
-            // directSig unavailable (direct RPC rejected) but Jito may have accepted —
-            // cannot confirm on-chain without a signature, so do not count as success.
-            if (bundleId) {
-                logger.warn(`[Executor] Jito bundle accepted (${bundleId}) but direct RPC rejected — cannot confirm on-chain`);
-                return false;
+                logger.info(`[Executor] Tx submitted: ${directSig} — confirming async`);
+                this._confirmAsync(directSig, finalBlockhash, finalLastValidBlockHeight, pair, profitUsd, grossProfit, bundleId).catch(() => {});
+                return true;
             }
 
             logger.warn(`[Executor] Both Jito and direct submission failed`);
@@ -763,6 +1050,315 @@ class Executor {
             logger.error(`[Executor] Execution error: ${e.message}`);
             discord.alertError(`Flashloan failed: ${e.message}`).catch(() => {});
             return false;
+        }
+    }
+
+    // -------------------------------------------------------
+    //  LOCAL EXECUTION — Orca Whirlpool direct pool routing
+    //  No Jupiter API calls. Builds swap instructions locally.
+    //  Called when checkCrossPoolSpread() finds a profitable
+    //  cross-DEX spread with known pool addresses.
+    // -------------------------------------------------------
+    async executeLocal(opportunity) {
+        const { buyPool, sellPool, pair, amountIn, spreadPct } = opportunity;
+        // buyPool/sellPool: { address, dexType, price, ... } from checkCrossPoolSpread
+        // amountIn: bigint lamports (SOL)
+ 
+        if (!this._kaminoBorrowTemplate) {
+            logger.error('[Executor] Kamino flashloan not initialized — call init() first');
+            return false;
+        }
+ 
+        const { buildOrcaSwapIx } = require('./orcaBuilder');
+        const { buildRaydiumSwapIx } = require('./raydiumBuilder');
+        const { getAssociatedTokenAddressSync, createAssociatedTokenAccountIdempotentInstruction, createCloseAccountInstruction, NATIVE_MINT } = require('@solana/spl-token');
+        const localPools = require('./localPools');
+ 
+        const solPrice = getSolPrice();
+        const amountLamports = Number(amountIn);
+        const amountBigInt = BigInt(amountIn);
+ 
+        this.stats.oppsDetected++;
+ 
+        // ── Step 1: Compute swap outputs with local math ──
+        const buyPoolState = localPools.getPoolState(buyPool.address);
+        const sellPoolState = localPools.getPoolState(sellPool.address);
+        if (!buyPoolState || !sellPoolState) {
+            logger.warn('[LocalExec] Pool state missing — buy:', !!buyPoolState, 'sell:', !!sellPoolState);
+            return false;
+        }
+ 
+        // Buy: SOL → tokenB on the LOW-priced pool
+        const buyResult = localPools.computeSwap(pair.tokenA, pair.tokenB, amountBigInt, buyPoolState);
+        if (!buyResult || buyResult.amountOut <= 0n) {
+            logger.warn('[LocalExec] Buy computeSwap failed');
+            return false;
+        }
+ 
+        // Sell: tokenB → SOL on the HIGH-priced pool
+        const sellResult = localPools.computeSwap(pair.tokenB, pair.tokenA, buyResult.amountOut, sellPoolState);
+        if (!sellResult || sellResult.amountOut <= 0n) {
+            logger.warn('[LocalExec] Sell computeSwap failed');
+            return false;
+        }
+ 
+        const grossProfit = sellResult.amountOut - amountBigInt;
+        const grossSol = (Number(grossProfit) / 1e9).toFixed(6);
+        const grossUsd = (Number(grossProfit) / 1e9 * solPrice).toFixed(4);
+ 
+        if (grossProfit <= 0n) {
+            logger.info(`[LocalExec] Net negative after local math: ${grossUsd} USD — skipping`);
+            return false;
+        }
+ 
+        if (!await this.isProfitable(grossProfit, amountBigInt)) {
+            logger.info(`[LocalExec] Below min profit — gross: ${grossSol} SOL (~$${grossUsd}) | pair: ${pair.name}`);
+            return false;
+        }
+ 
+        this.stats.oppsAttempted++;
+ 
+        logger.info(
+            `🎯 LOCAL EXEC — ${pair.name} | spread: ${(spreadPct * 100).toFixed(3)}% | ` +
+            `loan: ${(amountLamports / 1e9).toFixed(1)} SOL | profit: ~$${grossUsd} | ` +
+            `buy: ${buyPool.dexType}@${buyPool.address.slice(0,8)} → sell: ${sellPool.dexType}@${sellPool.address.slice(0,8)}`
+        );
+        discord.alertExecuting(pair.name, (spreadPct * 100).toFixed(3), (amountLamports / 1e9).toFixed(1), grossUsd).catch(() => {});
+ 
+        try {
+            // ── Step 2: Build Kamino flashloan ixs ──
+            const [borrowWrapper, repayWrapper] = this._buildKaminoIxs(amountLamports, 2);
+ 
+            // ── Step 3: Build local swap instructions ──
+            // Apply conservative 3% buffer on otherAmountThreshold (local math is single-tick approximation)
+            const buyThreshold = buyResult.amountOut * 97n / 100n;
+            const sellThreshold = (amountBigInt * 100n / 100n); // Must get back at least the borrow amount
+ 
+            // Buy swap: SOL → BONK on buyPool (picks builder by dexType)
+            const buySwap = buyPoolState.dexType === "Raydium CLMM"
+                ? buildRaydiumSwapIx({
+                    poolAddress: buyPool.address,
+                    poolState: buyPoolState,
+                    walletPubkey: this.wallet.publicKey,
+                    inputMint: pair.tokenA,
+                    amount: amountBigInt,
+                    otherAmountThreshold: buyThreshold,
+                    isBaseInput: true,
+                })
+                : buildOrcaSwapIx({
+                    whirlpoolAddress: buyPool.address,
+                    poolState: buyPoolState,
+                    walletPubkey: this.wallet.publicKey,
+                    inputMint: pair.tokenA,
+                    amount: amountBigInt,
+                    otherAmountThreshold: buyThreshold,
+                    amountSpecifiedIsInput: true,
+                });
+ 
+            // Sell swap: BONK → SOL on sellPool (picks builder by dexType)
+            const sellSwap = sellPoolState.dexType === "Raydium CLMM"
+                ? buildRaydiumSwapIx({
+                    poolAddress: sellPool.address,
+                    poolState: sellPoolState,
+                    walletPubkey: this.wallet.publicKey,
+                    inputMint: pair.tokenB,
+                    amount: buyResult.amountOut,
+                    otherAmountThreshold: sellThreshold,
+                    isBaseInput: true,
+                })
+                : buildOrcaSwapIx({
+                    whirlpoolAddress: sellPool.address,
+                    poolState: sellPoolState,
+                    walletPubkey: this.wallet.publicKey,
+                    inputMint: pair.tokenB,
+                    amount: buyResult.amountOut,
+                    otherAmountThreshold: sellThreshold,
+                    amountSpecifiedIsInput: true,
+                });
+ 
+            // ── Step 4: Compute budget ──
+            // Two Orca swaps: ~200K CU each, generous buffer
+            const computeBudgetProg = new PublicKey('ComputeBudget111111111111111111111111111111');
+            const cuLimitData = Buffer.alloc(5);
+            cuLimitData.writeUInt8(2, 0);
+            cuLimitData.writeUInt32LE(600_000, 1);
+            const cuLimitIx = new TransactionInstruction({
+                programId: computeBudgetProg,
+                keys: [],
+                data: cuLimitData,
+            });
+ 
+            // Compute unit price (priority fee) — 1 microlamport
+            const cuPriceData = Buffer.alloc(9);
+            cuPriceData.writeUInt8(3, 0);
+            cuPriceData.writeBigUInt64LE(1n, 1);
+            const cuPriceIx = new TransactionInstruction({
+                programId: computeBudgetProg,
+                keys: [],
+                data: cuPriceData,
+            });
+ 
+            // ── Step 5: Jito tip ──
+            const jitoTipLamports = this._computeJitoTip(grossProfit);
+            const tipUsd = (Number(jitoTipLamports) / 1e9 * solPrice).toFixed(4);
+            logger.info(`[LocalExec] Jito tip: ${jitoTipLamports} lamports (~$${tipUsd})`);
+            const jitoTipAccount = new PublicKey(
+                JITO_TIP_ACCOUNTS[Math.floor(Math.random() * JITO_TIP_ACCOUNTS.length)]
+            );
+            const jitoTipIx = SystemProgram.transfer({
+                fromPubkey: this.wallet.publicKey,
+                toPubkey: jitoTipAccount,
+                lamports: jitoTipLamports,
+            });
+ 
+            // ── Step 6: WSOL ATA create ──
+            const wsolAtaCreateIx = createAssociatedTokenAccountIdempotentInstruction(
+                this.wallet.publicKey,
+                this._kaminoWsolAta,
+                this.wallet.publicKey,
+                SOL_MINT
+            );
+ 
+            // ── Step 7: Assemble innerIxs ──
+            // Order: tip → wsolATA → borrow → computeBudget → buyATA → buySwap → sellSwap → repay → closeWSOL
+            const innerIxs = [
+                jitoTipIx,
+                wsolAtaCreateIx,
+                ...(borrowWrapper.instructions || []),
+                cuLimitIx,
+                cuPriceIx,
+            ];
+ 
+            // ATA create for output token (buy outputs BONK, need BONK ATA)
+            if (buySwap.ataIx) innerIxs.push(buySwap.ataIx);
+ 
+            // Buy swap
+            innerIxs.push(buySwap.swapIx);
+ 
+            // Sell swap (no extra ATA needed — sells back to WSOL which already exists)
+            innerIxs.push(sellSwap.swapIx);
+ 
+            // Repay
+            innerIxs.push(...(repayWrapper.instructions || []));
+ 
+            // Close WSOL ATA → unwrap profit to native SOL
+            const wsolAta = getAssociatedTokenAddressSync(NATIVE_MINT, this.wallet.publicKey);
+            innerIxs.push(createCloseAccountInstruction(wsolAta, this.wallet.publicKey, this.wallet.publicKey));
+ 
+            // ── Step 8: Dynamic borrowIxIndex ──
+            {
+                const KAMINO_PID = KAMINO_PROGRAM_ID.toBase58();
+                const borrowDiscHex = KAMINO_FLASH_BORROW_DISC.toString('hex');
+                let foundIdx = -1;
+                for (let i = 0; i < innerIxs.length; i++) {
+                    const ix = innerIxs[i];
+                    if (ix.programId.toBase58() === KAMINO_PID && ix.data.subarray(0, 8).toString('hex') === borrowDiscHex) {
+                        foundIdx = i;
+                        break;
+                    }
+                }
+                if (foundIdx === -1) throw new Error('Kamino borrow instruction not found in innerIxs');
+                const repayIx = innerIxs.find(ix => ix.programId.toBase58() === KAMINO_PID && ix.data.subarray(0, 8).toString('hex') === KAMINO_FLASH_REPAY_DISC.toString('hex'));
+                if (!repayIx) throw new Error('Kamino repay instruction not found in innerIxs');
+                repayIx.data.writeUInt8(foundIdx, 16);
+                logger.info('[LocalExec] borrowIxIndex dynamically set to ' + foundIdx);
+            }
+ 
+            // ── Step 9: Build transaction (no ALTs needed — small account count) ──
+            const freshBh = await this.connection.getLatestBlockhash('processed');
+            const { TransactionMessage, VersionedTransaction } = require('@solana/web3.js');
+            let flashTx = (() => {
+                const msg = new TransactionMessage({
+                    payerKey: this.wallet.publicKey,
+                    recentBlockhash: freshBh.blockhash,
+                    instructions: innerIxs,
+                }).compileToV0Message(); // No lookup tables
+                return new VersionedTransaction(msg);
+            })();
+ 
+            // ── Step 10: Sign ──
+            flashTx.sign([this.wallet]);
+ 
+            let serializedBuf;
+            try {
+                serializedBuf = Buffer.from(flashTx.serialize());
+            } catch (e) {
+                throw new Error(`Transaction too large to serialize: ${e.message}`);
+            }
+            if (serializedBuf.length > 1232) {
+                throw new Error(`Transaction too large: ${serializedBuf.length} bytes (limit 1232)`);
+            }
+            logger.info(`[LocalExec] Tx size: ${serializedBuf.length} bytes | ${innerIxs.length} instructions`);
+ 
+            // ── Step 11: Submit via Jito ──
+            const serialized = bs58.encode(serializedBuf);
+            const jitoTxEndpoints = [
+                'https://mainnet.block-engine.jito.wtf/api/v1/transactions',
+                'https://frankfurt.mainnet.block-engine.jito.wtf/api/v1/transactions',
+                'https://amsterdam.mainnet.block-engine.jito.wtf/api/v1/transactions',
+            ];
+            let directSig = null;
+            try {
+                directSig = await Promise.any(jitoTxEndpoints.map(endpoint =>
+                    axios.post(endpoint, {
+                        jsonrpc: '2.0', id: 1,
+                        method: 'sendTransaction',
+                        params: [serialized, { encoding: 'base58' }],
+                    }, {
+                        headers: { 'Content-Type': 'application/json' },
+                        timeout: 5000,
+                    }).then(resp => {
+                        if (!resp.data?.result) throw new Error('no result');
+                        logger.info('[LocalExec] Jito accepted via ' + endpoint.split('/')[2].split('.')[0]);
+                        return resp.data.result;
+                    })
+                ));
+            } catch {
+                directSig = bs58.encode(flashTx.signatures[0]);
+                logger.warn('[LocalExec] All Jito TX endpoints failed — using signature from signed tx');
+            }
+            this.stats.txSent++;
+ 
+            if (directSig) {
+                logger.info(`[LocalExec] ✅ Tx submitted: ${directSig}`);
+                this._confirmAsync(directSig, freshBh.blockhash, freshBh.lastValidBlockHeight, pair, grossUsd, grossProfit, null).catch(() => {});
+                return true;
+            }
+ 
+            logger.warn('[LocalExec] Submission failed');
+            return false;
+ 
+        } catch (e) {
+            logger.error(`[LocalExec] Error: ${e.message}`);
+            return false;
+        }
+    }
+    // -------------------------------------------------------
+    async _confirmAsync(sig, blockhash, lastValidBlockHeight, pair, profitUsd, grossProfit, bundleId) {
+        try {
+            const timeout = new Promise((_, reject) =>
+                setTimeout(() => reject(new Error('Confirmation timeout after 30s')), 30000)
+            );
+            const result = await Promise.race([
+                this.connection.confirmTransaction(
+                    { signature: sig, blockhash, lastValidBlockHeight },
+                    { commitment: 'confirmed', disableRetryOnRateLimit: true }
+                ),
+                timeout,
+            ]);
+            if (result.value.err) {
+                const reason = JSON.stringify(result.value.err);
+                logger.error(`[Executor] Tx failed on-chain: ${reason}`);
+                discord.alertTxFailed(pair.name, reason).catch(() => {});
+                return;
+            }
+            this.stats.txSuccess++;
+            this.stats.totalProfit += grossProfit;
+            logger.info(`✅ FLASHLOAN confirmed | Profit: ~${profitUsd} | Sig: ${sig}${bundleId ? ` | Bundle: ${bundleId}` : ''}`);
+            discord.alertTrade(profitUsd, pair.name, sig).catch(() => {});
+        } catch (err) {
+            logger.error(`[Executor] Tx confirmation failed: ${err.message}`);
+            discord.alertTxFailed(pair.name, err.message).catch(() => {});
         }
     }
 

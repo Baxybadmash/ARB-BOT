@@ -6,10 +6,11 @@
   "scripts": {
     "start": "node src/bot.js",
     "test": "node src/simulate.js",
-"update-pairs": "node -e \"require('dotenv').config(); const {updatePairs}=require('./src/pairUpdater'); updatePairs(100*1e9).then(p=>{ console.log('Done. Pairs:', p.map(x=>x.name).join(', ')); process.exit(0); })\""
+    "update-pairs": "node -e \"require('dotenv').config(); const {updatePairs}=require('./src/pairUpdater'); updatePairs(100*1e9).then(p=>{ console.log('Done. Pairs:', p.map(x=>x.name).join(', ')); process.exit(0); })\""
   },
   "dependencies": {
     "@coral-xyz/anchor": "^0.30.1",
+    "@kamino-finance/klend-sdk": "^7.3.22",
     "@mrgnlabs/marginfi-client-v2": "^6.4.1",
     "@mrgnlabs/mrgn-common": "^1.8.0",
     "@solana/spl-token": "^0.3.11",

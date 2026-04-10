@@ -13,10 +13,12 @@ const http  = require('http');
 const bs58       = require('bs58');
 const { PriceScanner, computeTargetLam }  = require('./scanner');
 const localPools = require('./localPools');
+const { localReSizeScan } = require('./localPools');
 const { Executor }                        = require('./executor');
 const { updatePairs, isUpdateDue, getUpdateStatus } = require('./pairUpdater');
 const { findOptimalLoanSize }                       = require('./loanSizer');
 const { PoolWatcher }                               = require('./poolWatcher');
+const xdexCooldowns = {};
 const logger                              = require('./logger');
 const discord                             = require('./discord');
 const { initPriceStream, getSolPrice }     = require('./price');
@@ -186,7 +188,7 @@ async function startBot() {
     let isExecuting  = false;
     let isScanning   = false;   // prevents overlapping fallback full-scans (scan takes ~3.7s)
     const lastWsScan = new Map(); // pair.name → timestamp, prevents WS burst
-    const WS_DEBOUNCE_MS = parseInt(process.env.WS_DEBOUNCE_MS || '200');  // min gap between WS scans of same pair
+    const WS_DEBOUNCE_MS = parseInt(process.env.WS_DEBOUNCE_MS || '100');  // min gap between WS scans of same pair
 
     // Shared execute helper — used by both WS trigger and slot fallback
     async function tryExecute(opportunities, label, triggerTime) {
@@ -206,14 +208,20 @@ async function startBot() {
             // Re-quote at target loan size only when expected gross exceeds MIN_PROFIT_USD.
             // Skips the 2 extra API calls (~200ms) for sub-threshold spreads that the
             // executor will reject anyway, keeping detection latency at ~220ms.
-            const targetLam = computeTargetLam(finalOpp.spreadPct, minFlashloanLamports, flashloanLamports);
-            if (targetLam > Number(finalOpp.amountIn) * 1.5 && finalOpp.spreadPct > 0.0001) {
-                const resized = await scanner.reSizeScan(finalOpp.pair, targetLam);
-                if (resized) {
-                    finalOpp = resized;
-                } else {
-                    logger.info(`[${label}] Skip(null): ${finalOpp.pair.name} spread=${(finalOpp.spreadPct*100).toFixed(4)}% target=${(targetLam/1e9).toFixed(1)}SOL`);
-                    return;
+            const localSized = localReSizeScan(finalOpp.pair, flashloanLamports, minFlashloanLamports);
+            if (localSized) {
+                logger.info(`[${label}] localReSizeScan hit: ${localSized.loanSizeSol.toFixed(2)} SOL spread=${(localSized.spreadPct*100).toFixed(4)}%`);
+                finalOpp = { ...finalOpp, amountIn: localSized.amountIn, loanSizeSol: localSized.loanSizeSol };
+            } else {
+                const targetLam = computeTargetLam(finalOpp.spreadPct, minFlashloanLamports, flashloanLamports);
+                if (targetLam > Number(finalOpp.amountIn) * 1.5 && finalOpp.spreadPct > 0.0001) {
+                    const resized = await scanner.reSizeScan(finalOpp.pair, targetLam);
+                    if (resized) {
+                        finalOpp = resized;
+                    } else {
+                        logger.info(`[${label}] Skip(null): ${finalOpp.pair.name} spread=${(finalOpp.spreadPct*100).toFixed(4)}% target=${(targetLam/1e9).toFixed(1)}SOL`);
+                        return;
+                    }
                 }
             }
             const scanMs = triggerTime ? Date.now() - triggerTime : null;
@@ -244,29 +252,66 @@ async function startBot() {
         executor.stats.slotsScanned++;
 
         // ── LOCAL POOL MATH PRE-FILTER ──────────────────────────
-        // For supported dexes: decode pool state locally, compute spread
-        // vs Binance price. Skip Jupiter entirely if spread is too thin.
-        const hasLocalMath = (dex === 'Orca' || dex === 'Raydium CLMM' || dex === 'Meteora') && (pair.name.endsWith('/USDC') || pair.name.endsWith('/USDT'))
+        // Update pool cache, then compare all pools for this pair
+        // against each other (cross-DEX spread, not pool-vs-Binance).
+        const hasLocalMath = (dex === 'Orca' || dex === 'Raydium CLMM' || dex === 'Meteora')
             && accountInfo && accountInfo.data && poolAddress;
+        if (dex === "Raydium AMM") return; // dormant — skip Jupiter to prevent rate limit storms
 
         if (hasLocalMath) {
-            const state = localPools.updatePoolState(poolAddress, accountInfo.data, dex);
-            if (state) {
-                const refPrice = getSolPrice();
-                if (refPrice > 0) {
-                    const poolPrice = localPools.getPoolPrice(state);
-                    if (poolPrice <= 0) return; // empty pool or decode error
-                    const spreadPct = Math.abs(poolPrice - refPrice) / refPrice;
+            localPools.updatePoolState(poolAddress, accountInfo.data, dex);
+        }
 
-                    if (spreadPct < 0.0007) {
-                        logger.debug(`[WS-Local] ${pair.name} spread=${(spreadPct*100).toFixed(4)}% < 0.07% — skip`);
-                        return;
+        // Skip Raydium AMM for non-USD pairs — no local math, pure noise
+        if (dex === 'Raydium AMM' && !pair.name.endsWith('/USDC') && !pair.name.endsWith('/USDT')) return;
+
+        // ── CROSS-DEX SPREAD GATE (Phase 1) ────────────────────
+        // Check if real cross-DEX spread exists before burning a Jupiter call.
+        // Logs hi/lo pool dex types + fees for strategy analysis.
+        if (hasLocalMath) {
+      let executed = false;
+      if (xdexCooldowns[pair.name] && Date.now() - xdexCooldowns[pair.name] < 3000) return;
+      const XDEX_DEAD_PAIRS = ["SOL/USDT", "SOL/USDC", "SOL/WIF", "SOL/FARTCOIN"];
+      if (XDEX_DEAD_PAIRS.includes(pair.name)) return;
+            const xSpread = localPools.checkCrossPoolSpread(pair.name, 120000);
+            if (xSpread && xSpread.spreadPct > 0) {
+                const hiState = localPools.getPoolState(xSpread.hiPool.address);
+                const loState = localPools.getPoolState(xSpread.loPool.address);
+                const hiFee = hiState && hiState.feeRate !== null ? Number(hiState.feeRate) / Number(hiState.feeDenom) : null;
+                const loFee = loState && loState.feeRate !== null ? Number(loState.feeRate) / Number(loState.feeDenom) : null;
+                const feeSum = (hiFee || 0.0025) + (loFee || 0.0025); // default 0.25% if unknown
+                const spreadPctFmt = (xSpread.spreadPct * 100).toFixed(4);
+                const feeSumPctFmt = (feeSum * 100).toFixed(4);
+                const profitable = xSpread.spreadPct > feeSum;
+                logger.info(`[XDEX] ${pair.name} | spread: ${spreadPctFmt}% | fees: ${feeSumPctFmt}% | ${profitable ? "PROFITABLE" : "sub-fee"} | hi: ${xSpread.hiPool.dexType} (${xSpread.hiPool.price.toFixed(6)}) ${xSpread.hiPool.address} | lo: ${xSpread.loPool.dexType} (${xSpread.loPool.price.toFixed(6)}) ${xSpread.loPool.address}`);
+                // ── Phase 2: Local execution when cross-DEX spread is profitable ──
+                if (profitable && (xSpread.hiPool.dexType === 'Orca' || xSpread.hiPool.dexType === 'Raydium CLMM') && (xSpread.loPool.dexType === 'Orca' || xSpread.loPool.dexType === 'Raydium CLMM')) {
+                    const MAX_LOCAL_SOL = 40;
+                    const LOCAL_STEPS = [1.0, 0.5, 0.25, 0.1, 0.05, 0.025];
+                    const maxLam = BigInt(Math.min(flashloanLamports, MAX_LOCAL_SOL * 1e9));
+                    try {
+                        for (const step of LOCAL_STEPS) {
+                            const loanLamports = BigInt(Math.floor(Number(maxLam) * step));
+                            if (loanLamports < 1000000000n) break; // floor 1 SOL
+                            const result = await executor.executeLocal({
+                                buyPool: xSpread.loPool,
+                                sellPool: xSpread.hiPool,
+                                pair,
+                                amountIn: loanLamports,
+                                spreadPct: xSpread.spreadPct,
+                            });
+                            if (result) { executed = true; break; }
+                        }
+                    } catch (e) {
+                        logger.error(`[XDEX] Local execution error: ${e.message}`);
                     }
-                    logger.info(`[WS-Local] ${pair.name} spread=${(spreadPct*100).toFixed(4)}% pool=$${poolPrice.toFixed(2)} ref=$${refPrice.toFixed(2)} dex=${dex}`);
+                    return; // Skip Jupiter — local path handles this opportunity
                 }
             }
-            // If local math decode failed (no state), fall through to Jupiter as safety net
+      if (!executed) xdexCooldowns[pair.name] = Date.now();
+            return; // hasLocalMath pair — XDEX handles it, never fall through to Jupiter
         }
+
 
         // ── JUPITER COOLDOWN — applies to ALL events reaching this point ──
         if (now - (lastJupiterCall.get(pair.name) || 0) < JUPITER_COOLDOWN_MS) return;
@@ -293,8 +338,26 @@ async function startBot() {
             localCount++;
         }
     }
-    logger.info('[LocalPools] Registered ' + localCount + ' pools (Orca + Raydium CLMM) for local math');
+    logger.info('[LocalPools] Registered ' + localCount + ' pools (Orca + Raydium CLMM + Meteora) for local math');
 
+    // Seed pool cache with initial RPC fetch for all registered pools
+    logger.info("[LocalPools] Seeding pool cache with initial RPC data...");
+    const { PublicKey } = require("@solana/web3.js");
+    const regKeys = Array.from(localPools._poolRegistry.keys());
+    const BATCH = 100;
+    for (let i = 0; i < regKeys.length; i += BATCH) {
+      const batch = regKeys.slice(i, i + BATCH).map(k => new PublicKey(k));
+      try {
+        const infos = await connection.getMultipleAccountsInfo(batch);
+        for (let j = 0; j < infos.length; j++) {
+          if (infos[j] && infos[j].data) {
+            const reg = localPools._poolRegistry.get(regKeys[i+j]);
+            localPools.updatePoolState(regKeys[i+j], infos[j].data, reg.dexType);
+          }
+        }
+      } catch(e) { logger.warn("[LocalPools] Seed batch failed: " + e.message); }
+    }
+    logger.info("[LocalPools] Seeded " + localPools._poolCache.size + " pools in cache");
     // -------------------------------------------------------
     //  FALLBACK: Slot polling — catches pairs without WS subs
     //  Reduced to every 5 slots (~2s) since WS handles most.
@@ -323,7 +386,7 @@ async function startBot() {
             const fallbackStart = Date.now();
             try {
                 logger.debug(`[Fallback] Slot ${slot} — full scan ${scanner.activePairs.length} pairs`);
-                const opps = await scanner.findOpportunities(minFlashloanLamports, flashloanLamports);
+                const _rawOpps = await scanner.findOpportunities(minFlashloanLamports, flashloanLamports); const opps = _rawOpps.filter(o => !["SOL/USDT","SOL/USDC","SOL/WIF","SOL/FARTCOIN"].includes(o.pair?.name || o.pairName || ""));
                 await tryExecute(opps, 'Fallback', fallbackStart);
             } catch (e) {
                 logger.error(`[Fallback] Slot ${slot} error: ${e.message}`);

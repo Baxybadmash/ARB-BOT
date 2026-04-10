@@ -1,6 +1,38 @@
+# Secrets — NEVER commit
 .env
-data/marginfi_account.json
-data/pairs.json
-logs/
+.env.*
+!.env.example
+*.key
+*.keypair
+*-keypair.json
+wallet.json
+id.json
+keypair.json
+target/deploy/*.json
+
+# Node
 node_modules/
-.claude
+npm-debug.log*
+
+# Logs
+logs/
+*.log
+pm2.log
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Editor
+.vscode/
+.idea/
+*.swp
+
+# Backups
+*.bak
+*.bak.*
+*.backup
+STATE.md.bak
+
+# Build artifacts
+target/

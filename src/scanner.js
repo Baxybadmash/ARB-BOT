@@ -28,6 +28,8 @@ const JUPITER_QUOTE_API = process.env.JUPITER_API_KEY
 
 // Global 429 backoff state
 let _rateLimitedUntil = 0;
+let _storm429Count = 0;
+let _storm429Timer = null;
 const RATE_LIMIT_PAUSE_MS = 15 * 1000;
 
 // Single priority queue — WS (fast) calls jump to front, fallback (slow) calls go to back.
@@ -111,6 +113,8 @@ async function _doQuote(inputMint, outputMint, amount, extraParams = {}) {
                 outputMint,
                 amount,
                 slippageBps:         parseInt(process.env.SLIPPAGE_BPS || '50'),
+                // excludeDexes removed — using Jito sendTransaction (no vote account restriction)
+                restrictIntermediateTokens: true,
                 asLegacyTransaction: false,
                 maxAccounts:         parseInt(process.env.JUPITER_MAX_ACCOUNTS || '14'),
                 ...extraParams
@@ -124,7 +128,9 @@ async function _doQuote(inputMint, outputMint, amount, extraParams = {}) {
     } catch (e) {
         if (e.response?.status === 429) {
             _rateLimitedUntil = Date.now() + RATE_LIMIT_PAUSE_MS;
-            logger.warn(`[Scanner] Jupiter rate limit hit — pausing quotes for ${RATE_LIMIT_PAUSE_MS / 1000}s`);
+            _storm429Count++;
+            logger.warn(`[Scanner] Jupiter rate limit hit — pausing quotes for ${RATE_LIMIT_PAUSE_MS / 1000}s (storm: ${_storm429Count}/15)`);
+            if (_storm429Count >= 15) { logger.error('[Scanner] 429 STORM detected (15+ in 60s) — forcing restart'); process.exit(1); }
         } else {
             logger.debug(`Jupiter quote error: ${e.message}`);
         }
@@ -153,8 +159,8 @@ function _computeTargetLam(spreadPct, minLam, maxLam) {
     if (s <= 0) return minLam;
     const solPrice     = parseFloat(process.env.SOL_PRICE_USD  || '90');
     const minProfitUsd = parseFloat(process.env.MIN_PROFIT_USD || '0.30');
-    const MAX_SOL_CAP  = 5; // never exceed 30 SOL — limits market impact on thin pairs
-    const targetSol    = Math.min((minProfitUsd * 1.2) / (s * solPrice), MAX_SOL_CAP);
+    const MAX_SOL_CAP  = 40; // never exceed 30 SOL — limits market impact on thin pairs
+    const targetSol    = MAX_SOL_CAP; // always max size, reSizeScan steps down if needed
     const targetLam    = Math.floor(targetSol * 1e9);
     return Math.max(Math.min(targetLam, maxLam), minLam);
 }
@@ -289,6 +295,102 @@ class PriceScanner {
     }
 
     // -------------------------------------------------------
+    //  MULTI-DEX SCAN — quotes buy leg on each DEX individually,
+    //  finds best cross-DEX spread, then does roundtrip on best pair.
+    //  Uses 5 parallel buy calls + 1 sell call = 6 API calls total.
+    // -------------------------------------------------------
+    async scanPairMultiDex(pair, minAmountIn, maxAmountIn, quoteFn = _jupiterQuoteFast) {
+        const TARGET_DEXES = ['Whirlpool', 'Raydium CLMM', 'Meteora DLMM', 'HumidiFi', 'ZeroFi'];
+
+        // Phase 1 — sequential buy quotes on each DEX (respects rate limiter queue)
+        const buyPrices = [];
+        for (const dex of TARGET_DEXES) {
+            try {
+                const q = await quoteFn(pair.tokenA, pair.tokenB, minAmountIn, { dexes: dex });
+                if (q?.outAmount) buyPrices.push({ dex, outAmount: BigInt(q.outAmount), quote: q });
+            } catch {}
+        }
+
+        if (buyPrices.length < 2) return null;
+
+        // Sort: highest outAmount = most tokenB per SOL = expensive venue (sell here)
+        //       lowest outAmount = least tokenB per SOL = cheap venue (buy here)
+        buyPrices.sort((a, b) => (a.outAmount > b.outAmount ? 1 : a.outAmount < b.outAmount ? -1 : 0));
+
+        const cheapBuy = buyPrices[0];                      // buy here (least tokenB)
+        const expensiveBuy = buyPrices[buyPrices.length - 1]; // sell here (most tokenB)
+
+        // Check spread before wasting a sell call
+        const rawSpread = Number(expensiveBuy.outAmount - cheapBuy.outAmount) / Number(cheapBuy.outAmount);
+        if (rawSpread < 0.0003) return null; // < 0.03% not worth the sell call
+
+        // Phase 2 — buy on cheap DEX, sell the output on expensive DEX
+        const buyQuote = cheapBuy.quote;
+        const tokenOut = cheapBuy.outAmount;
+
+        const sellQuote = await quoteFn(pair.tokenB, pair.tokenA, tokenOut.toString(), { dexes: expensiveBuy.dex });
+        if (!sellQuote?.outAmount) return null;
+
+        const solBack = BigInt(sellQuote.outAmount);
+        const probeProfit = solBack - BigInt(minAmountIn);
+        const spreadPct = Number(probeProfit) / Number(minAmountIn);
+
+        if (spreadPct > 0.50) {
+            logger.warn(`[${pair.name}] MultiDex implausible spread ${(spreadPct * 100).toFixed(2)}% — skipping`);
+            return null;
+        }
+
+        if (probeProfit <= 0n) {
+            logger.debug(`[${pair.name}] MultiDex negative: buy=${cheapBuy.dex} sell=${expensiveBuy.dex} rawSpread=${(rawSpread*100).toFixed(3)}% roundtrip=${(spreadPct*100).toFixed(4)}%`);
+            return null;
+        }
+
+        logger.info(`[${pair.name}] MultiDex HIT: buy=${cheapBuy.dex} sell=${expensiveBuy.dex} spread=${(spreadPct*100).toFixed(4)}% profit=${probeProfit}`);
+
+        // Compute target loan size
+        const targetLam = _computeTargetLam(spreadPct, minAmountIn, maxAmountIn);
+
+        let bestBuyQuote = buyQuote;
+        let bestSellQuote = sellQuote;
+        let grossProfit = probeProfit;
+        let amountIn = BigInt(minAmountIn);
+
+        // Re-quote at target size with forced DEX routing
+        if (targetLam > minAmountIn * 1.5) {
+            const buyFull = await quoteFn(pair.tokenA, pair.tokenB, targetLam, { dexes: cheapBuy.dex });
+            if (buyFull?.outAmount) {
+                const fullTokenOut = BigInt(buyFull.outAmount);
+                const sellFull = await quoteFn(pair.tokenB, pair.tokenA, fullTokenOut.toString(), { dexes: expensiveBuy.dex });
+                if (sellFull?.outAmount) {
+                    const fullProfit = BigInt(sellFull.outAmount) - BigInt(targetLam);
+                    if (fullProfit > 0n) {
+                        bestBuyQuote = buyFull;
+                        bestSellQuote = sellFull;
+                        grossProfit = fullProfit;
+                        amountIn = BigInt(targetLam);
+                    }
+                }
+            }
+        }
+
+        if (grossProfit <= 0n) return null;
+
+        return {
+            pair,
+            amountIn,
+            loanSizeSol:     Number(amountIn) / 1e9,
+            grossProfit,
+            spreadPct,
+            priceDiffPct:    (Math.abs(spreadPct) * 100).toFixed(3),
+            bestDex:         `${cheapBuy.dex}→${expensiveBuy.dex}`,
+            bestBuyQuote,
+            reverseQuote:    bestSellQuote,
+            amountAfterBuy:  BigInt(bestBuyQuote.outAmount),
+            amountAfterSell: BigInt(bestSellQuote.outAmount),
+        };
+    }
+
+    // -------------------------------------------------------
     async findOpportunities(minLamports, maxLamports) {
         // Check rate limit before starting
         if (Date.now() < _rateLimitedUntil) {
@@ -344,7 +446,7 @@ class PriceScanner {
             }
         }
         try {
-            const result = await this.scanPair(pair, minLamports, maxLamports, _jupiterQuoteFast, true);
+            const result = await this.scanPair(pair, minLamports, maxLamports, _jupiterQuoteFast);
             this._scanCache.set(pair.name, { result: result || null, timestamp: Date.now() });
             if (result && result.grossProfit > 0n) return [result];
         } catch (e) {

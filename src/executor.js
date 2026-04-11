@@ -66,6 +66,20 @@ const DATA_DIR          = path.join(__dirname, '..', 'data');
 //  KAMINO FLASHLOAN CONSTANTS
 // -------------------------------------------------------
 const KAMINO_PROGRAM_ID   = new PublicKey('KLend2g3cP87fffoy8q1mQqGKjrxjC8boSyAYavgmjD');
+
+// ── ALT for local executor (reduces tx size from ~1400 to ~700 bytes) ──
+let _cachedAltAccount = null;
+async function _getAltAccount(connection) {
+    if (_cachedAltAccount) return _cachedAltAccount;
+    const altAddr = process.env.ALT_ADDRESS;
+    if (!altAddr) return null;
+    const altPk = new PublicKey(altAddr);
+    const res = await connection.getAddressLookupTable(altPk);
+    if (!res || !res.value) { console.error("[ALT] Failed to fetch ALT:", altAddr); return null; }
+    _cachedAltAccount = res.value;
+    console.log("[ALT] Loaded ALT with " + _cachedAltAccount.state.addresses.length + " addresses");
+    return _cachedAltAccount;
+}
 const KAMINO_MARKET       = new PublicKey('7u3HeHxYDLhnCoErrtycNokbQYbWGzLs6JSDqGAv5PfF');
 const KAMINO_MARKET_AUTH  = new PublicKey('9DrvZvyWh1HuAoZxvYWMvkf2XCzryCpGgHqrMjyDWpmo');
 const KAMINO_SOL_RESERVE  = new PublicKey('d4A2prbA2whesmvHaL88BH6Ewn5N4bTSU2Ze8P6Bc4Q');
@@ -1060,6 +1074,8 @@ class Executor {
     //  cross-DEX spread with known pool addresses.
     // -------------------------------------------------------
     async executeLocal(opportunity) {
+        const _LAT = { t0: Date.now() };
+        const BYPASS_COMPUTESWAP = process.env.BYPASS_COMPUTESWAP === '1';
         const { buyPool, sellPool, pair, amountIn, spreadPct } = opportunity;
         // buyPool/sellPool: { address, dexType, price, ... } from checkCrossPoolSpread
         // amountIn: bigint lamports (SOL)
@@ -1106,15 +1122,19 @@ class Executor {
         const grossSol = (Number(grossProfit) / 1e9).toFixed(6);
         const grossUsd = (Number(grossProfit) / 1e9 * solPrice).toFixed(4);
  
-        if (grossProfit <= 0n) {
-            logger.info(`[LocalExec] Net negative after local math: ${grossUsd} USD — skipping`);
-            return false;
+        if (BYPASS_COMPUTESWAP) {
+            logger.warn(`[LocalExec] ⚠️  computeSwap BYPASSED — pipeline test mode | gross local: ${grossUsd} USD`);
+        } else {
+            if (grossProfit <= 0n) {
+                logger.info(`[LocalExec] Net negative after local math: ${grossUsd} USD — skipping`);
+                return false;
+            }
+            if (!await this.isProfitable(grossProfit, amountBigInt)) {
+                logger.info(`[LocalExec] Below min profit — gross: ${grossSol} SOL (~$${grossUsd}) | pair: ${pair.name}`);
+                return false;
+            }
         }
- 
-        if (!await this.isProfitable(grossProfit, amountBigInt)) {
-            logger.info(`[LocalExec] Below min profit — gross: ${grossSol} SOL (~$${grossUsd}) | pair: ${pair.name}`);
-            return false;
-        }
+        _LAT.tGate = Date.now();
  
         this.stats.oppsAttempted++;
  
@@ -1131,8 +1151,12 @@ class Executor {
  
             // ── Step 3: Build local swap instructions ──
             // Apply conservative 3% buffer on otherAmountThreshold (local math is single-tick approximation)
-            const buyThreshold = buyResult.amountOut * 97n / 100n;
-            const sellThreshold = (amountBigInt * 100n / 100n); // Must get back at least the borrow amount
+            // BYPASS mode: computeSwap output unreliable, use very loose buffer (10%)
+            // Normal mode: 3% buffer accounts for single-tick approximation error
+            const buyBufferPct = BYPASS_COMPUTESWAP ? 90n : 97n;
+            const buyThreshold = buyResult.amountOut * buyBufferPct / 100n;
+            // Sell threshold = borrow amount (atomic revert protects us if we get less)
+            const sellThreshold = BYPASS_COMPUTESWAP ? 1n : amountBigInt;
  
             // Buy swap: SOL → BONK on buyPool (picks builder by dexType)
             const buySwap = buyPoolState.dexType === "Raydium CLMM"
@@ -1265,14 +1289,37 @@ class Executor {
             }
  
             // ── Step 9: Build transaction (no ALTs needed — small account count) ──
+            // DEBUG: dump every ix's data length, programId, account count, AND hex contents
+            logger.info(`[DBG] innerIxs.length=${innerIxs.length}`);
+            for (let _i = 0; _i < innerIxs.length; _i++) {
+                const _ix = innerIxs[_i];
+                const _hex = _ix.data ? Buffer.from(_ix.data).toString('hex') : 'null';
+                logger.info(`[DBG] ix[${_i}] prog=${_ix.programId.toBase58().slice(0,8)} keys=${_ix.keys.length} dataLen=${_ix.data ? _ix.data.length : 'null'} hex=${_hex}`);
+                for (let _k = 0; _k < _ix.keys.length; _k++) {
+                    const _key = _ix.keys[_k];
+                    let _pkInfo;
+                    try {
+                        const _pk = _key.pubkey;
+                        if (!_pk) { _pkInfo = 'NULL_PUBKEY'; }
+                        else if (typeof _pk.toBuffer !== 'function') { _pkInfo = 'NOT_PK_TYPE=' + typeof _pk + ' val=' + String(_pk).slice(0,20); }
+                        else {
+                            const _b = _pk.toBuffer();
+                            _pkInfo = 'len=' + _b.length + ' b58=' + _pk.toBase58();
+                        }
+                    } catch (e) { _pkInfo = 'THREW: ' + e.message; }
+                    logger.info(`[DBG]   k[${_k}] s=${_key.isSigner?1:0} w=${_key.isWritable?1:0} ${_pkInfo}`);
+                }
+            }
+            const altAccount = await _getAltAccount(this.connection);
             const freshBh = await this.connection.getLatestBlockhash('processed');
+            _LAT.tBuildStart = Date.now();
             const { TransactionMessage, VersionedTransaction } = require('@solana/web3.js');
             let flashTx = (() => {
                 const msg = new TransactionMessage({
                     payerKey: this.wallet.publicKey,
                     recentBlockhash: freshBh.blockhash,
                     instructions: innerIxs,
-                }).compileToV0Message(); // No lookup tables
+                }).compileToV0Message(altAccount ? [altAccount] : []); // ALT for size reduction
                 return new VersionedTransaction(msg);
             })();
  
@@ -1291,6 +1338,7 @@ class Executor {
             logger.info(`[LocalExec] Tx size: ${serializedBuf.length} bytes | ${innerIxs.length} instructions`);
  
             // ── Step 11: Submit via Jito ──
+            _LAT.tSigned = Date.now();
             const serialized = bs58.encode(serializedBuf);
             const jitoTxEndpoints = [
                 'https://mainnet.block-engine.jito.wtf/api/v1/transactions',
@@ -1318,7 +1366,9 @@ class Executor {
                 logger.warn('[LocalExec] All Jito TX endpoints failed — using signature from signed tx');
             }
             this.stats.txSent++;
- 
+            _LAT.tSubmitted = Date.now();
+            logger.info(`[LAT] gate=${_LAT.tGate-_LAT.t0}ms build=${_LAT.tBuildStart-_LAT.tGate}ms sign=${_LAT.tSigned-_LAT.tBuildStart}ms submit=${_LAT.tSubmitted-_LAT.tSigned}ms TOTAL=${_LAT.tSubmitted-_LAT.t0}ms`);
+
             if (directSig) {
                 logger.info(`[LocalExec] ✅ Tx submitted: ${directSig}`);
                 this._confirmAsync(directSig, freshBh.blockhash, freshBh.lastValidBlockHeight, pair, grossUsd, grossProfit, null).catch(() => {});
@@ -1330,6 +1380,7 @@ class Executor {
  
         } catch (e) {
             logger.error(`[LocalExec] Error: ${e.message}`);
+            logger.error(`[LocalExec] Stack: ${e.stack}`);
             return false;
         }
     }

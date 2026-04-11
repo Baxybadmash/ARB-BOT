@@ -282,7 +282,8 @@ async function startBot() {
                 const feeSum = (hiFee || 0.0025) + (loFee || 0.0025); // default 0.25% if unknown
                 const spreadPctFmt = (xSpread.spreadPct * 100).toFixed(4);
                 const feeSumPctFmt = (feeSum * 100).toFixed(4);
-                const profitable = xSpread.spreadPct > feeSum;
+                // FORCE_EXEC=1 bypasses profitability gate for pipeline diagnostic
+                const profitable = process.env.FORCE_EXEC === '1' ? true : (xSpread.spreadPct > feeSum);
                 logger.info(`[XDEX] ${pair.name} | spread: ${spreadPctFmt}% | fees: ${feeSumPctFmt}% | ${profitable ? "PROFITABLE" : "sub-fee"} | hi: ${xSpread.hiPool.dexType} (${xSpread.hiPool.price.toFixed(6)}) ${xSpread.hiPool.address} | lo: ${xSpread.loPool.dexType} (${xSpread.loPool.price.toFixed(6)}) ${xSpread.loPool.address}`);
                 // ── Phase 2: Local execution when cross-DEX spread is profitable ──
                 if (profitable && (xSpread.hiPool.dexType === 'Orca' || xSpread.hiPool.dexType === 'Raydium CLMM') && (xSpread.loPool.dexType === 'Orca' || xSpread.loPool.dexType === 'Raydium CLMM')) {
@@ -294,8 +295,11 @@ async function startBot() {
                             const loanLamports = BigInt(Math.floor(Number(maxLam) * step));
                             if (loanLamports < 1000000000n) break; // floor 1 SOL
                             const result = await executor.executeLocal({
-                                buyPool: xSpread.loPool,
-                                sellPool: xSpread.hiPool,
+                                // hiPool/loPool refer to BONK-per-SOL price ratio.
+                                // To BUY BONK with SOL, go where you get MORE BONK per SOL → hiPool.
+                                // To SELL BONK back to SOL, go where SOL costs more BONK → loPool.
+                                buyPool: xSpread.hiPool,
+                                sellPool: xSpread.loPool,
                                 pair,
                                 amountIn: loanLamports,
                                 spreadPct: xSpread.spreadPct,

@@ -15,7 +15,7 @@ const TICK_ARRAY_SIZE = 60;
 
 function deriveTickArrayPDA(poolPubkey, startTickIndex) {
     const buf = Buffer.alloc(4);
-    buf.writeInt32BE(startTickIndex);
+    buf.writeInt32LE(startTickIndex);
     return PublicKey.findProgramAddressSync(
         [Buffer.from("tick_array"), poolPubkey.toBuffer(), buf],
         RAYDIUM_CLMM_PROGRAM_ID

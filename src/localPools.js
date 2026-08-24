@@ -85,7 +85,14 @@ function updatePoolState(addr, data, dexType) {
     if (!reg) return null;
     const state = decodePoolState(data, dexType || reg.dexType);
     if (!state) return null;
-    if (state.feeRate === null) state.feeRate = reg.feeRate || RAYDIUM.DEFAULT_FEE;
+    if (state.feeRate === null) {
+        // BUG 6 fix: SOL/BONK Raydium CLMM pool uses 0.25% fee (2500/1000000)
+        if (state.dexType === 'Raydium CLMM' && addr === 'GtKKKs3yaPdHbQd2aZS4SfWhy8zQ988BJGnKNndLxYsN') {
+            state.feeRate = 2500n;
+        } else {
+            state.feeRate = reg.feeRate || RAYDIUM.DEFAULT_FEE;
+        }
+    }
     const prev = poolCache.get(addr);
     const priceChanged = !prev || prev.sqrtPrice !== state.sqrtPrice;
     const cached = { ...state, pairName:reg.pairName, tokenA:reg.tokenA, tokenB:reg.tokenB,
@@ -177,31 +184,54 @@ function checkCrossPoolSpread(pairName, maxAgeMs = 3000) {
     const pools = getPoolsForPair(pairName);
     if (pools.length < 2) return null;
 
-    // Group fresh pools by dexType, keep best (highest liquidity) per DEX
-    const dexBest = new Map();
+    // Collect ALL fresh pools with their fee info
+    const fresh = [];
     for (const p of pools) {
         if (p.liquidity === 0n) continue; if (p.dexType === 'Meteora') continue;
         const age = Date.now() - (p.lastUpdate || 0);
         if (age > maxAgeMs) continue;
         const px = getPoolPrice(p);
         if (px <= 0) continue;
+        const fee = (p.feeRate !== null && p.feeDenom) ? Number(p.feeRate) / Number(p.feeDenom) : 0.0025;
+        // Only allow pools with VERIFIED tick arrays at current tick
+        const VERIFIED_POOLS = new Set([
+            // ts=2 pools (2bps fee) — PRIMARY BUY SIDE
+            'FpCMFDFGYotvufJ7HrFHsWEiiQCGbkLCtwHiDnh7o28Q', // SOL/USDC Orca ts=2 (0.02%)
+            'FwewVm8u6tFPGewAyHmWAqad9hmF7mvqxK4mJ7iNqqGC', // SOL/USDT Orca ts=2 (0.02%)
+            // ts=4 pools (4bps fee) — PRIMARY SELL SIDE
+            'Czfq3xZZDmsdGdUyrNLtRhGc47cXcZtLG4crryfu44zE', // SOL/USDC Orca ts=4 (0.04%)
+            'HcoJqG325TTifs6jyWvRJ9ET4pDu12Xrt2EQKZGFmuKX', // SOL/USDT Orca ts=4 (0.04%)
+            // ts=8 pools (5bps fee) — BACKUP
+            '7qbRF6YsyGuLUVs6Y1q64bdVrfe4ZcUUz1JRdoVNUJnm', // SOL/USDC Orca ts=8 (0.05%)
+            // SOL/WIF kept for future use
+            'D6NdKrKNQPmRZCCnG1GqXtF7MMoHB7qR6GU5TkG59Qz1', // SOL/WIF Orca ts=4 (0.04%)
+        ]);
+        if (!VERIFIED_POOLS.has(p.address)) continue;
+        fresh.push({ address: p.address, dexType: p.dexType, price: px, liquidity: p.liquidity, fee });
+    }
 
-        const existing = dexBest.get(p.dexType);
-        if (!existing || p.liquidity > existing.liquidity) {
-            dexBest.set(p.dexType, { address: p.address, dexType: p.dexType, price: px, liquidity: p.liquidity });
+    if (fresh.length < 2) return null;
+
+    // Find the best pair: highest spread MINUS combined fees
+    // Only consider pairs where combined fee < 0.20% (viable for arb)
+    const MAX_COMBINED_FEE = 0.0020; // 0.20%
+    let bestNet = -Infinity, bestHi = null, bestLo = null;
+    for (let i = 0; i < fresh.length; i++) {
+        for (let j = i + 1; j < fresh.length; j++) {
+            const a = fresh[i], b = fresh[j];
+            const combinedFee = a.fee + b.fee;
+            if (combinedFee > MAX_COMBINED_FEE) continue;
+            const hi = a.price > b.price ? a : b;
+            const lo = a.price > b.price ? b : a;
+            const spread = (hi.price - lo.price) / lo.price;
+            const net = spread - combinedFee;
+            if (net > bestNet) { bestNet = net; bestHi = hi; bestLo = lo; }
         }
     }
 
-    const reps = Array.from(dexBest.values());
-    if (reps.length < 2) return null;
-
-    let hi = reps[0], lo = reps[0];
-    for (let i = 1; i < reps.length; i++) {
-        if (reps[i].price > hi.price) hi = reps[i];
-        if (reps[i].price < lo.price) lo = reps[i];
-    }
-    const spread = (hi.price - lo.price) / lo.price;
-    return { spreadPct: spread, hiPool: hi, loPool: lo };
+    if (!bestHi || !bestLo) return null;
+    const spread = (bestHi.price - bestLo.price) / bestLo.price;
+    return { spreadPct: spread, hiPool: bestHi, loPool: bestLo };
 }
 
 function localReSizeScan(pair, maxLamports, minProfitLamports) {

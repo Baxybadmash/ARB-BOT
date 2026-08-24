@@ -271,7 +271,8 @@ async function startBot() {
         if (hasLocalMath) {
       let executed = false;
       if (xdexCooldowns[pair.name] && Date.now() - xdexCooldowns[pair.name] < 3000) return;
-      const XDEX_DEAD_PAIRS = ["SOL/USDT", "SOL/USDC", "SOL/WIF", "SOL/FARTCOIN"];
+      xdexCooldowns[pair.name] = Date.now(); // BUG 3 fix: set cooldown BEFORE execution
+      const XDEX_DEAD_PAIRS = ["SOL/FARTCOIN"];
       if (XDEX_DEAD_PAIRS.includes(pair.name)) return;
             const xSpread = localPools.checkCrossPoolSpread(pair.name, 120000);
             if (xSpread && xSpread.spreadPct > 0) {
@@ -287,8 +288,8 @@ async function startBot() {
                 logger.info(`[XDEX] ${pair.name} | spread: ${spreadPctFmt}% | fees: ${feeSumPctFmt}% | ${profitable ? "PROFITABLE" : "sub-fee"} | hi: ${xSpread.hiPool.dexType} (${xSpread.hiPool.price.toFixed(6)}) ${xSpread.hiPool.address} | lo: ${xSpread.loPool.dexType} (${xSpread.loPool.price.toFixed(6)}) ${xSpread.loPool.address}`);
                 // ── Phase 2: Local execution when cross-DEX spread is profitable ──
                 if (profitable && (xSpread.hiPool.dexType === 'Orca' || xSpread.hiPool.dexType === 'Raydium CLMM') && (xSpread.loPool.dexType === 'Orca' || xSpread.loPool.dexType === 'Raydium CLMM')) {
-                    const MAX_LOCAL_SOL = 40;
-                    const LOCAL_STEPS = [1.0, 0.5, 0.25, 0.1, 0.05, 0.025];
+                    const MAX_LOCAL_SOL = 2;
+                    const LOCAL_STEPS = [1.0, 0.5];
                     const maxLam = BigInt(Math.min(flashloanLamports, MAX_LOCAL_SOL * 1e9));
                     try {
                         for (const step of LOCAL_STEPS) {
@@ -312,7 +313,7 @@ async function startBot() {
                     return; // Skip Jupiter — local path handles this opportunity
                 }
             }
-      if (!executed) xdexCooldowns[pair.name] = Date.now();
+      // BUG 3: old cooldown removed — now set before execution
             return; // hasLocalMath pair — XDEX handles it, never fall through to Jupiter
         }
 

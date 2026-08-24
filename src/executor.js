@@ -1094,11 +1094,10 @@ class Executor {
         const amountLamports = Number(amountIn);
         const amountBigInt = BigInt(amountIn);
  
-        this.stats.oppsDetected++;
  
         // ── Step 1: Compute swap outputs with local math ──
-        const buyPoolState = localPools.getPoolState(buyPool.address);
-        const sellPoolState = localPools.getPoolState(sellPool.address);
+        let buyPoolState = localPools.getPoolState(buyPool.address);
+        let sellPoolState = localPools.getPoolState(sellPool.address);
         if (!buyPoolState || !sellPoolState) {
             logger.warn('[LocalExec] Pool state missing — buy:', !!buyPoolState, 'sell:', !!sellPoolState);
             return false;
@@ -1124,13 +1123,18 @@ class Executor {
  
         if (BYPASS_COMPUTESWAP) {
             logger.warn(`[LocalExec] ⚠️  computeSwap BYPASSED — pipeline test mode | gross local: ${grossUsd} USD`);
+        } else if (amountBigInt <= 2000000000n) {
+            // Small loans (≤2 SOL): trust spread math, skip computeSwap gate
+            // Single-tick computeSwap overestimates price impact on CLMM pools
+            // Flashloan atomic revert protects us — worst case is lost Jito tip (~$0.004)
+            logger.info(`[LocalExec] Small loan (${(Number(amountBigInt)/1e9).toFixed(1)} SOL) — trusting spread, skipping computeSwap gate | local math: ${grossUsd} USD`);
         } else {
             if (grossProfit <= 0n) {
                 logger.info(`[LocalExec] Net negative after local math: ${grossUsd} USD — skipping`);
                 return false;
             }
             if (!await this.isProfitable(grossProfit, amountBigInt)) {
-                logger.info(`[LocalExec] Below min profit — gross: ${grossSol} SOL (~$${grossUsd}) | pair: ${pair.name}`);
+                logger.info(`[LocalExec] Below min profit — gross: ${grossSol} SOL (~${grossUsd}) | pair: ${pair.name}`);
                 return false;
             }
         }
@@ -1149,7 +1153,32 @@ class Executor {
             // ── Step 2: Build Kamino flashloan ixs ──
             const [borrowWrapper, repayWrapper] = this._buildKaminoIxs(amountLamports, 2);
  
-            // ── Step 3: Build local swap instructions ──
+            // ── Step 2b: Fresh pool state fetch (batched — single RPC call) ──
+            {
+                const fetchPools = [buyPool, sellPool].filter(p => p.dexType === 'Orca' || p.dexType === 'Raydium CLMM');
+                if (fetchPools.length > 0) {
+                    try {
+                        const keys = fetchPools.map(p => new PublicKey(p.address));
+                        const infos = await this.connection.getMultipleAccountsInfo(keys);
+                        for (let i = 0; i < fetchPools.length; i++) {
+                            if (infos[i] && infos[i].data) {
+                                localPools.updatePoolState(fetchPools[i].address, infos[i].data, fetchPools[i].dexType);
+                            }
+                        }
+                        logger.info('[LocalExec] Batch-refreshed ' + fetchPools.length + ' pool states');
+                    } catch (e) {
+                        logger.warn('[LocalExec] Batch pool fetch failed (429?): ' + e.message.slice(0, 80));
+                    }
+                }
+            }
+
+            // Re-read pool states after fresh fetch (tick arrays may have changed)
+            const freshBuyState = localPools.getPoolState(buyPool.address);
+            const freshSellState = localPools.getPoolState(sellPool.address);
+            if (freshBuyState) buyPoolState = freshBuyState;
+            if (freshSellState) sellPoolState = freshSellState;
+
+                        // ── Step 3: Build local swap instructions ──
             // Apply conservative 3% buffer on otherAmountThreshold (local math is single-tick approximation)
             // BYPASS mode: computeSwap output unreliable, use very loose buffer (10%)
             // Normal mode: 3% buffer accounts for single-tick approximation error
@@ -1289,29 +1318,9 @@ class Executor {
             }
  
             // ── Step 9: Build transaction (no ALTs needed — small account count) ──
-            // DEBUG: dump every ix's data length, programId, account count, AND hex contents
-            logger.info(`[DBG] innerIxs.length=${innerIxs.length}`);
-            for (let _i = 0; _i < innerIxs.length; _i++) {
-                const _ix = innerIxs[_i];
-                const _hex = _ix.data ? Buffer.from(_ix.data).toString('hex') : 'null';
-                logger.info(`[DBG] ix[${_i}] prog=${_ix.programId.toBase58().slice(0,8)} keys=${_ix.keys.length} dataLen=${_ix.data ? _ix.data.length : 'null'} hex=${_hex}`);
-                for (let _k = 0; _k < _ix.keys.length; _k++) {
-                    const _key = _ix.keys[_k];
-                    let _pkInfo;
-                    try {
-                        const _pk = _key.pubkey;
-                        if (!_pk) { _pkInfo = 'NULL_PUBKEY'; }
-                        else if (typeof _pk.toBuffer !== 'function') { _pkInfo = 'NOT_PK_TYPE=' + typeof _pk + ' val=' + String(_pk).slice(0,20); }
-                        else {
-                            const _b = _pk.toBuffer();
-                            _pkInfo = 'len=' + _b.length + ' b58=' + _pk.toBase58();
-                        }
-                    } catch (e) { _pkInfo = 'THREW: ' + e.message; }
-                    logger.info(`[DBG]   k[${_k}] s=${_key.isSigner?1:0} w=${_key.isWritable?1:0} ${_pkInfo}`);
-                }
-            }
+
             const altAccount = await _getAltAccount(this.connection);
-            const freshBh = await this.connection.getLatestBlockhash('processed');
+            const freshBh = this._blockhashCache || await this.connection.getLatestBlockhash('processed');
             _LAT.tBuildStart = Date.now();
             const { TransactionMessage, VersionedTransaction } = require('@solana/web3.js');
             let flashTx = (() => {

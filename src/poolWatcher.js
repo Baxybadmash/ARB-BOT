@@ -22,7 +22,7 @@ const DEBOUNCE_MS = 50; // deduplicate rapid multi-pool fires for same pair; rea
 const WHIRLPOOL_PROGRAM = new PublicKey('whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc');
 const ORCA_CONFIG       = new PublicKey('2LecshUwdy9xi7meFgHtFJQNSKk4KdTrcpvaB56dP2NQ');
 // Tick spacings for fee tiers: 0.01%, 0.05%, 0.3%, 1%, 2% + Splash pools
-const ORCA_TICK_SPACINGS = [1, 8, 64, 128, 256, 32768];
+const ORCA_TICK_SPACINGS = [1, 2, 4, 8, 16, 64, 128, 256, 32768];
 
 function deriveOrcaPoolAddresses(pairs) {
     const found = [];
